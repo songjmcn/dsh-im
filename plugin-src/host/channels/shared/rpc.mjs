@@ -1,5 +1,9 @@
 import { SET_ALIAS_ENDPOINT, validAliasPayload } from './bot-alias-rpc.mjs';
 import { registerManagementRpc } from '../../../management-rpc.mjs';
+import {
+  SET_CONVERSATION_DIRECTORY_ENDPOINT,
+  validConversationDirectoryPayload,
+} from './conversation-directory-rpc.mjs';
 import { SET_CONTEXT_ENHANCEMENT_ENDPOINT, validContextEnhancementPayload } from './context-enhancement-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from './access-policy-rpc.mjs';
 import { resolveRpcAuthority } from '../../rpc-authority.mjs';
@@ -26,6 +30,7 @@ export const TOKEN_BOT_ENDPOINTS = Object.freeze({
   setContextEnhancement: SET_CONTEXT_ENHANCEMENT_ENDPOINT,
   setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
   setAlias: SET_ALIAS_ENDPOINT,
+  setConversationDirectory: SET_CONVERSATION_DIRECTORY_ENDPOINT,
 });
 
 const ENDPOINTS = Object.freeze(Object.values(TOKEN_BOT_ENDPOINTS));
@@ -95,6 +100,10 @@ function payloadFailure(endpoint, payload) {
   if (endpoint === TOKEN_BOT_ENDPOINTS.setAlias) {
     return validAliasPayload(payload)
       ? null : '请输入有效的别名（最多 80 个字符）。';
+  }
+  if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectory) {
+    return validConversationDirectoryPayload(payload)
+      ? null : '请输入有效的会话目录设置。';
   }
   return 'Unknown bot endpoint.';
 }
@@ -192,6 +201,9 @@ export function createTokenBotRpcHandler(controller, { channel }) {
       } else if (endpoint === TOKEN_BOT_ENDPOINTS.setAgentPreset) {
         if (typeof controller.updateAgentPreset !== 'function') throw new Error('Agent preset update is unavailable');
         value = await controller.updateAgentPreset(payload.botId, payload.agentPreset);
+      } else if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectory) {
+        if (typeof controller.updateConversationDirectory !== 'function') throw new Error('Conversation directory update is unavailable');
+        value = await controller.updateConversationDirectory(payload.botId, payload.config);
       } else {
         value = await controller.deleteBot(payload.botId);
       }

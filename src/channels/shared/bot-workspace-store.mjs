@@ -20,6 +20,12 @@ import {
 } from './access-policy.mjs';
 import { CONNECTION_TEST_STATE_IDENTITY } from './connection-test.mjs';
 import {
+  CONVERSATION_DIRECTORY_STRATEGIES,
+  DEFAULT_CONVERSATION_DIRECTORY_SETTINGS,
+  normalizeConversationDirectorySettings,
+  validateConversationDirectorySettings,
+} from './conversation-directory.mjs';
+import {
   DEFAULT_CONTEXT_ENHANCEMENT_CONFIG,
   normalizeContextEnhancementConfig,
   validateContextEnhancementConfig,
@@ -129,6 +135,66 @@ function normalizeConversationWorkspaces(value) {
     if (Object.keys(normalized).length > 0) conversationWorkspaces[botId] = normalized;
   }
   return conversationWorkspaces;
+}
+
+/**
+ * Per-conversation record of the directory isolation minted for it. The base is
+ * stored rather than derived so a later `/new` cannot nest a directory inside
+ * the conversation's own previous directory.
+ */
+function normalizeSessionDirectories(value) {
+  const sessionDirectories = Object.create(null);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return sessionDirectories;
+  // Damage is isolated per entry: a dropped record only costs the conversation
+  // one directory re-derivation, it never blocks the bot.
+  for (const [botId, entries] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(botId)) continue;
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries)) continue;
+    const normalized = Object.create(null);
+    for (const [conversationKey, entry] of Object.entries(entries)) {
+      if (typeof conversationKey !== 'string' || !conversationKey) continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const { base, directory, strategy } = entry;
+      if (typeof base !== 'string' || !isAbsolute(base)) continue;
+      if (typeof directory !== 'string' || !isAbsolute(directory)) continue;
+      if (!CONVERSATION_DIRECTORY_STRATEGIES.includes(strategy)) continue;
+      normalized[conversationKey] = {
+        base: resolve(base),
+        directory: resolve(directory),
+        strategy,
+        ...(Number.isSafeInteger(entry.createdAt) && entry.createdAt >= 0
+          ? { createdAt: entry.createdAt }
+          : {}),
+      };
+    }
+    if (Object.keys(normalized).length > 0) sessionDirectories[botId] = normalized;
+  }
+  return sessionDirectories;
+}
+
+function normalizeConversationDirectoryMap(value) {
+  const settings = Object.create(null);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return settings;
+  for (const [botId, config] of Object.entries(value)) {
+    if (/^[A-Za-z0-9_-]{1,128}$/.test(botId)) {
+      settings[botId] = normalizeConversationDirectorySettings(config);
+    }
+  }
+  return settings;
+}
+
+/**
+ * The channel-wide isolation switch. Damage resolves to absent rather than to
+ * the disabled defaults, because writing a guess back would turn one bad edit
+ * into a persisted decision that hides the mistake.
+ */
+function normalizeGlobalConversationDirectory(value) {
+  if (value === undefined) return null;
+  try {
+    return validateConversationDirectorySettings(value);
+  } catch {
+    return null;
+  }
 }
 
 function normalizeDeliveryTarget(value, { targetId, allowSessionSync = false } = {}) {
@@ -306,6 +372,9 @@ function normalizeDocument(value) {
     }
   }
   const accessPolicies = normalizeAccessPolicies(value.accessPolicies, workspaces);
+  const sessionDirectories = normalizeSessionDirectories(value.sessionDirectories);
+  const conversationDirectories = normalizeConversationDirectoryMap(value.conversationDirectories);
+  const conversationDirectory = normalizeGlobalConversationDirectory(value.conversationDirectory);
   const version = Math.max(
     value.version,
     value.accessPolicies === undefined ? 1 : DELIVERY_DOCUMENT_VERSION,
@@ -316,6 +385,9 @@ function normalizeDocument(value) {
     version,
     workspaces,
     conversationWorkspaces,
+    sessionDirectories,
+    conversationDirectories,
+    conversationDirectory,
     agentPresets,
     models,
     contextEnhancement,
@@ -329,6 +401,9 @@ function storedDocument({
   version,
   workspaces,
   conversationWorkspaces,
+  sessionDirectories,
+  conversationDirectories,
+  conversationDirectory,
   agentPresets,
   models,
   contextEnhancement,
@@ -341,6 +416,13 @@ function storedDocument({
   if (Object.keys(conversationWorkspaces).length > 0) {
     document.conversationWorkspaces = conversationWorkspaces;
   }
+  if (Object.keys(sessionDirectories).length > 0) {
+    document.sessionDirectories = sessionDirectories;
+  }
+  if (Object.keys(conversationDirectories).length > 0) {
+    document.conversationDirectories = conversationDirectories;
+  }
+  if (conversationDirectory) document.conversationDirectory = conversationDirectory;
   if (Object.keys(agentPresets).length > 0) document.agentPresets = agentPresets;
   if (Object.keys(models).length > 0) document.models = models;
   if (Object.keys(contextEnhancement).length > 0) {
@@ -400,6 +482,9 @@ export class BotWorkspaceStore {
   #deliveryTargets = Object.create(null);
   #accessPolicies = Object.create(null);
   #conversationWorkspaces = Object.create(null);
+  #sessionDirectories = Object.create(null);
+  #conversationDirectories = Object.create(null);
+  #conversationDirectory = null;
   #generations = new Map();
   #nextGeneration = 1;
   #conversationGenerations = new Map();
@@ -431,6 +516,9 @@ export class BotWorkspaceStore {
       this.#deliveryTargets = normalized.deliveryTargets;
       this.#accessPolicies = normalized.accessPolicies;
       this.#conversationWorkspaces = normalized.conversationWorkspaces;
+      this.#sessionDirectories = normalized.sessionDirectories;
+      this.#conversationDirectories = normalized.conversationDirectories;
+      this.#conversationDirectory = normalized.conversationDirectory;
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
       this.#version = 1;
@@ -442,6 +530,9 @@ export class BotWorkspaceStore {
       this.#deliveryTargets = Object.create(null);
       this.#accessPolicies = Object.create(null);
       this.#conversationWorkspaces = Object.create(null);
+      this.#sessionDirectories = Object.create(null);
+      this.#conversationDirectories = Object.create(null);
+      this.#conversationDirectory = null;
     }
     this.#generations.clear();
     this.#nextGeneration = 1;
@@ -492,6 +583,35 @@ export class BotWorkspaceStore {
     const override = this.#conversationWorkspaces[id]?.[conversationKey];
     if (override) return override;
     return this.workspaceFor(id);
+  }
+
+  /**
+   * The directory isolation record for one conversation, or null when the
+   * conversation has never been isolated. The bot workspace scope reads this
+   * before minting a directory so `/new` never nests one inside the
+   * conversation's previous directory.
+   */
+  sessionDirectoryFor(botId, conversationKey) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return null;
+    const entry = this.#sessionDirectories[botIdOf(botId)]?.[conversationKey];
+    return entry ? { ...entry } : null;
+  }
+
+  conversationDirectorySettingsFor(botId) {
+    const id = botIdOf(botId);
+    if (Object.hasOwn(this.#conversationDirectories, id)) {
+      return { ...this.#conversationDirectories[id] };
+    }
+    // The channel-wide switch is the default every bot inherits; a bot with its
+    // own saved value keeps it, so one bot can opt out of a channel that enabled
+    // isolation for everyone.
+    if (this.#conversationDirectory) return { ...this.#conversationDirectory };
+    return { ...DEFAULT_CONVERSATION_DIRECTORY_SETTINGS };
+  }
+
+  /** The channel-wide switch, or null when the deployment never set one. */
+  defaultConversationDirectorySettings() {
+    return this.#conversationDirectory ? { ...this.#conversationDirectory } : null;
   }
 
   conversationGenerationFor(botId, conversationKey) {
@@ -877,6 +997,53 @@ export class BotWorkspaceStore {
     });
   }
 
+  /**
+   * Persist the directory isolation settings for one bot. Validated and
+   * defaulted like every other bot-level setting: a deployment that never
+   * saves a value keeps `enabled: false` and writes into its workspace as
+   * before.
+   */
+  async setConversationDirectorySettings(botId, value, { incarnation } = {}) {
+    const id = botIdOf(botId);
+    const expectedIncarnation = incarnation === undefined ? this.incarnationFor(id) : incarnation;
+    const settings = validateConversationDirectorySettings(value);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id) || expectedIncarnation !== this.incarnationFor(id)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const next = { ...this.#conversationDirectories, [id]: settings };
+      // A message already in flight keeps the previous committed snapshot until
+      // the new one reaches disk.
+      await this.#persist(undefined, undefined, undefined, undefined, undefined,
+        undefined, undefined, next);
+      this.#conversationDirectories = next;
+      return settings;
+    });
+  }
+
+  /**
+   * Persist the channel-wide isolation switch, which every bot without its own
+   * saved value inherits. `null` clears it and returns those bots to isolation
+   * off.
+   */
+  async setDefaultConversationDirectorySettings(value) {
+    const settings = value === null ? null : validateConversationDirectorySettings(value);
+    return this.#enqueueGlobal(async () => {
+      const previous = this.#conversationDirectory;
+      this.#conversationDirectory = settings;
+      try {
+        await this.#persist(undefined, undefined, undefined, undefined, undefined,
+          undefined, undefined, undefined, settings);
+      } catch (error) {
+        this.#conversationDirectory = previous;
+        throw error;
+      }
+      return settings;
+    });
+  }
+
   async setContextEnhancement(botId, value, { incarnation } = {}) {
     const id = botIdOf(botId);
     const expectedIncarnation = incarnation === undefined ? this.incarnationFor(id) : incarnation;
@@ -1007,6 +1174,20 @@ export class BotWorkspaceStore {
       assertCurrentSwitch();
       if (Object.keys(next).length > 0) this.#conversationWorkspaces[id] = next;
       else delete this.#conversationWorkspaces[id];
+      // An explicit switch re-picks the base workspace, so the directory the
+      // automation minted for this conversation no longer applies; the next
+      // isolated Session derives a fresh one below the new base. Without this
+      // the record would keep re-applying the directory the user just left.
+      const previousDirectories = this.#sessionDirectories[id];
+      const hadDirectory = Boolean(previousDirectories)
+        && Object.hasOwn(previousDirectories, key);
+      const previousDirectory = previousDirectories?.[key];
+      if (hadDirectory) {
+        const directories = { ...previousDirectories };
+        delete directories[key];
+        if (Object.keys(directories).length > 0) this.#sessionDirectories[id] = directories;
+        else delete this.#sessionDirectories[id];
+      }
       try {
         // Binding a conversation to its own current default is still persisted:
         // a later bot-default change must not move a conversation that pinned
@@ -1021,9 +1202,120 @@ export class BotWorkspaceStore {
         } else {
           delete this.#conversationWorkspaces[id];
         }
+        if (hadDirectory) {
+          this.#sessionDirectories[id] = {
+            ...(previousDirectories ?? {}),
+            [key]: previousDirectory,
+          };
+        }
         throw error;
       }
       return this.conversationWorkspaceFor(id, key);
+    });
+  }
+
+  /**
+   * Atomically put one conversation's isolated directory in force and record
+   * the base it was derived from.
+   *
+   * The workspace override and the directory record must commit together: a
+   * record without its override would be re-derived on the next call (nesting a
+   * directory inside its predecessor), and an override without its record would
+   * silently become the next base. One `#persist` writes both, and a failed
+   * write restores both.
+   */
+  async applyConversationSessionDirectory(botId, conversationKey, value, {
+    token,
+    clearSession,
+    incarnation,
+  } = {}) {
+    const id = botIdOf(botId);
+    const key = conversationKeyOf(conversationKey);
+    if (typeof token !== 'number') throw new TypeError('token is required');
+    if (!this.has(id)
+      || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+      const error = new Error('找不到要修改的机器人。');
+      error.code = 'workspace-bot-not-found';
+      throw error;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new TypeError('session directory value is required');
+    }
+    const { strategy } = value;
+    if (!CONVERSATION_DIRECTORY_STRATEGIES.includes(strategy)) {
+      throw new TypeError('Invalid conversation directory strategy');
+    }
+    // Validate both paths before queueing so an unusable directory fails without
+    // disturbing the conversation's current workspace or its session.
+    const directory = await validateWorkspacePath(value.directory);
+    const base = await validateWorkspacePath(value.base);
+    return this.#enqueue(id, async () => {
+      const assertCurrentSwitch = () => {
+        if (!this.has(id)
+          || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+          const error = new Error('找不到要修改的机器人。');
+          error.code = 'workspace-bot-not-found';
+          throw error;
+        }
+        if (!this.isConversationWorkspaceSwitchCurrent(id, key, token)) {
+          throw workspaceSessionStale(
+            'The conversation workspace changed before this directory could be applied.',
+          );
+        }
+      };
+      assertCurrentSwitch();
+      if (this.conversationWorkspaceFor(id, key) === directory
+        && this.sessionDirectoryFor(id, key)?.directory === directory) {
+        return directory;
+      }
+      const previousOverrides = this.#conversationWorkspaces[id];
+      const hadOverride = Boolean(previousOverrides)
+        && Object.hasOwn(previousOverrides, key);
+      const previous = previousOverrides?.[key];
+      const previousDirectories = this.#sessionDirectories[id];
+      const hadDirectory = Boolean(previousDirectories)
+        && Object.hasOwn(previousDirectories, key);
+      const previousDirectory = previousDirectories?.[key];
+      const directoryValue = Object.freeze({
+        base,
+        directory,
+        strategy,
+        createdAt: Date.now(),
+      });
+      await clearSession?.();
+      assertCurrentSwitch();
+      this.#conversationWorkspaces[id] = { ...previousOverrides, [key]: directory };
+      this.#sessionDirectories[id] = { ...previousDirectories, [key]: directoryValue };
+      try {
+        await this.#persist();
+      } catch (error) {
+        if (hadOverride) {
+          this.#conversationWorkspaces[id] = {
+            ...(previousOverrides ?? {}),
+            [key]: previous,
+          };
+        } else if (previousOverrides) {
+          const overrides = { ...previousOverrides };
+          delete overrides[key];
+          this.#conversationWorkspaces[id] = overrides;
+        } else {
+          delete this.#conversationWorkspaces[id];
+        }
+        if (hadDirectory) {
+          this.#sessionDirectories[id] = {
+            ...(previousDirectories ?? {}),
+            [key]: previousDirectory,
+          };
+        } else if (previousDirectories) {
+          const directories = { ...previousDirectories };
+          delete directories[key];
+          this.#sessionDirectories[id] = directories;
+        } else {
+          delete this.#sessionDirectories[id];
+        }
+        throw error;
+      }
+      return directory;
     });
   }
 
@@ -1236,6 +1528,8 @@ export class BotWorkspaceStore {
       ...Object.keys(this.#deliveryTargets),
       ...Object.keys(this.#accessPolicies),
       ...Object.keys(this.#conversationWorkspaces),
+      ...Object.keys(this.#sessionDirectories),
+      ...Object.keys(this.#conversationDirectories),
       ...this.#dirtyRemovals,
     ]);
     for (const botId of candidates) {
@@ -1256,6 +1550,12 @@ export class BotWorkspaceStore {
           model: this.modelFor(bot.botId),
           contextEnhancement: this.contextEnhancementFor(bot.botId),
           accessPolicy: this.accessPolicyFor(bot.botId),
+          // Only a deployment that configured isolation reports the field: one
+          // that never opted in keeps the exact status payload it had before
+          // isolation existed.
+          ...(Object.hasOwn(this.#conversationDirectories, bot.botId) || this.#conversationDirectory
+            ? { conversationDirectory: this.conversationDirectorySettingsFor(bot.botId) }
+            : {}),
         }
         : bot),
     };
@@ -1297,8 +1597,11 @@ export class BotWorkspaceStore {
     const hadDeliveryTargets = Object.hasOwn(this.#deliveryTargets, id);
     const hadAccessPolicy = Object.hasOwn(this.#accessPolicies, id);
     const hadConversationWorkspaces = Object.hasOwn(this.#conversationWorkspaces, id);
+    const hadSessionDirectories = Object.hasOwn(this.#sessionDirectories, id);
+    const hadConversationDirectories = Object.hasOwn(this.#conversationDirectories, id);
     const needsCleanup = hadWorkspace || hadPreset || hadModel || hadAlias || hadContextEnhancement
       || hadDeliveryTargets || hadAccessPolicy || hadConversationWorkspaces
+      || hadSessionDirectories || hadConversationDirectories
       || this.#dirtyRemovals.has(id);
     delete this.#workspaces[id];
     delete this.#agentPresets[id];
@@ -1308,6 +1611,8 @@ export class BotWorkspaceStore {
     delete this.#deliveryTargets[id];
     delete this.#accessPolicies[id];
     delete this.#conversationWorkspaces[id];
+    delete this.#sessionDirectories[id];
+    delete this.#conversationDirectories[id];
     this.#generations.delete(id);
     this.#incarnations.delete(id);
     if (!needsCleanup) return {
@@ -1337,6 +1642,17 @@ export class BotWorkspaceStore {
     return queued;
   }
 
+  /**
+   * Serialize a channel-wide write on the same queue as every bot write, so two
+   * saves can never interleave their document sections. No bot waits on it, and
+   * it parks no bot key that `whenBotIdle` would report on.
+   */
+  async #enqueueGlobal(operation) {
+    const queued = this.#writeQueue.then(operation, operation);
+    this.#writeQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
   async #persist(
     contextEnhancement = this.#contextEnhancement,
     deliveryTargets = this.#deliveryTargets,
@@ -1344,11 +1660,17 @@ export class BotWorkspaceStore {
     accessPolicies = this.#accessPolicies,
     aliases = this.#aliases,
     conversationWorkspaces = this.#conversationWorkspaces,
+    sessionDirectories = this.#sessionDirectories,
+    conversationDirectories = this.#conversationDirectories,
+    conversationDirectory = this.#conversationDirectory,
   ) {
     await writeStoredDocument(this.#path, storedDocument({
       version,
       workspaces: this.#workspaces,
       conversationWorkspaces,
+      sessionDirectories,
+      conversationDirectories,
+      conversationDirectory,
       agentPresets: this.#agentPresets,
       models: this.#models,
       contextEnhancement,
@@ -1367,7 +1689,10 @@ export class BotWorkspaceStore {
       || Object.keys(this.#contextEnhancement).length > 0
       || Object.keys(this.#deliveryTargets).length > 0
       || Object.keys(this.#accessPolicies).length > 0
-      || Object.keys(this.#conversationWorkspaces).length > 0) {
+      || Object.keys(this.#conversationWorkspaces).length > 0
+      || Object.keys(this.#sessionDirectories).length > 0
+      || Object.keys(this.#conversationDirectories).length > 0
+      || this.#conversationDirectory !== null) {
       await this.#persist();
       return;
     }
@@ -1764,6 +2089,40 @@ export function createBotWorkspaceScope(
             },
             incarnation,
           }));
+        };
+      }
+      if (property === 'conversationDirectorySettings') {
+        return () => {
+          assertCurrentBotScope(isCurrentScope);
+          return workspaces.conversationDirectorySettingsFor(botId);
+        };
+      }
+      if (property === 'sessionDirectory') {
+        // Read-only: the message path consults the recorded base so a new
+        // Session derives its directory below the base, not below the previous
+        // directory.
+        return (conversationKey) => {
+          if (!isCurrentScope()) return null;
+          return workspaces.sessionDirectoryFor(botId, conversationKey);
+        };
+      }
+      if (property === 'switchConversationSessionDirectory') {
+        return (conversationKey, value) => {
+          if (!isCurrentScope()) {
+            const error = new Error('找不到要修改的机器人。');
+            error.code = 'workspace-bot-not-found';
+            return Promise.reject(error);
+          }
+          const token = workspaces.publishConversationWorkspaceSwitch(botId, conversationKey);
+          maskConversationSwitch(conversationKey, token);
+          return trackConversationSwitch(conversationKey,
+            workspaces.applyConversationSessionDirectory(botId, conversationKey, value, {
+              token,
+              clearSession: async () => {
+                await state.clearSession(conversationKey);
+              },
+              incarnation,
+            }));
         };
       }
       if (property === 'bindWorkspaceSession') {
@@ -2262,6 +2621,35 @@ export function createWorkspaceAwareController(controller, {
       return result;
     });
   };
+  const updateConversationDirectory = (botId, value, projectStatus) => {
+    const incarnation = workspaces.incarnationFor(botId);
+    const settings = validateConversationDirectorySettings(value);
+    return withBotTransition(botId, async () => {
+      const snapshot = await controller.status();
+      if (!snapshot?.bots?.some((bot) => bot?.botId === botId)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const [catalog, models] = await Promise.all([
+        resolveAgentPresetCatalog(agentPresetCatalog),
+        resolveModelCatalog(modelCatalog),
+      ]);
+      const decorated = workspaces.decorateStatus(snapshot);
+      const updated = {
+        ...decorated,
+        bots: decorated.bots.map((bot) => bot?.botId === botId
+          ? { ...bot, conversationDirectory: settings } : bot),
+        ...(catalog ? { agentPresetCatalog: catalog } : {}),
+        ...(models ? { modelCatalog: models } : {}),
+      };
+      // Prepare the complete channel-specific response before commit so a
+      // failed projection never publishes running settings that did not save.
+      const result = projectStatus ? await projectStatus(updated) : updated;
+      await workspaces.setConversationDirectorySettings(botId, settings, { incarnation });
+      return result;
+    });
+  };
   const deleteWithWorkspace = (botId, invokeDelete) => withBotTransition(botId, async () => {
     // Fence the old runtime without changing the durable mapping. A crash
     // before the controller removes its config therefore keeps the bot's
@@ -2305,6 +2693,7 @@ export function createWorkspaceAwareController(controller, {
       if (property === 'updateAlias') return updateAlias;
       if (property === 'updateContextEnhancement') return updateContextEnhancement;
       if (property === 'updateAccessPolicy') return updateAccessPolicy;
+      if (property === 'updateConversationDirectory') return updateConversationDirectory;
       const value = Reflect.get(target, property, target);
       if (typeof value !== 'function') return value;
       if (property === 'deleteBot') {

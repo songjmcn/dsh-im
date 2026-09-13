@@ -18,6 +18,7 @@ import { publicWorkspaceError, validWorkspacePayload } from '../shared/workspace
 import { validAgentPresetPayload } from '../shared/agent-preset-rpc.mjs';
 import { validModelPayload } from '../shared/model-setting-rpc.mjs';
 import { validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
+import { validConversationDirectoryPayload } from '../shared/conversation-directory-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
 import { normalizeContextEnhancementConfig } from '../../../../src/channels/shared/context-enhancement.mjs';
 import {
@@ -459,6 +460,10 @@ function validPayload(endpoint, payload) {
     return validAliasPayload(payload)
       ? null : '请输入有效的别名（最多 80 个字符）。';
   }
+  if (endpoint === FEISHU_ENDPOINTS.setConversationDirectory) {
+    return validConversationDirectoryPayload(payload)
+      ? null : '请输入有效的会话目录设置。';
+  }
   if (endpoint === FEISHU_ENDPOINTS.setGroupResponseMode) {
     return hasOnlyKeys(payload, new Set(['botId', 'groupResponseMode']))
       && safeOpaqueId(payload.botId)
@@ -759,6 +764,14 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
         if (typeof controller.updateAgentPreset !== 'function') throw new Error('Agent preset update is unavailable');
         value = await toPublicFeishuStatus(
           await controller.updateAgentPreset(payload.botId, payload.agentPreset),
+          { encodeQr: cachedEncodeQr },
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setConversationDirectory) {
+        if (typeof controller.updateConversationDirectory !== 'function') {
+          throw new Error('Conversation directory update is unavailable');
+        }
+        value = await toPublicFeishuStatus(
+          await controller.updateConversationDirectory(payload.botId, payload.config),
           { encodeQr: cachedEncodeQr },
         );
       } else if (endpoint === FEISHU_ENDPOINTS.setGroupResponseMode) {
