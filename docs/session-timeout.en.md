@@ -56,7 +56,11 @@ Session-timeout configuration is spread over three places. The split mirrors the
 
 **Document version & compatibility**: the `sessionTimeout` sub-object shares `version: 1` with inbound-ttl — **no new version number is introduced**. An old file without the sub-object is treated as defaults (`enabled: false`) and never misread. A damaged or future-version file falls back to "**disabled** + default threshold", so an unreadable intent never widens into session unbinding — the same fallback direction as inbound-ttl's "damaged → keep-forever".
 
-**Write timing**: only the RPC `set` and the first `touch` write to disk; the periodic scan never writes.
+**Write timing**: only the RPC `set` (including the startup write of host-config defaults) touches disk; `touch` and the periodic scan never do.
+
+**Activity is not persisted**: each conversation's `lastActivityAt` / `runningSince` / `sessionId` live only in an in-memory Map and are never written into `settings.json`. Touches happen on every inbound message and every turn end, so persisting them would rewrite the whole file at high frequency and freeze a growing set of platform identifiers (chat_id / open_id) into the user's config file. The trade-off is that **a restart resets every idle window**: a conversation must idle for the full threshold again before it is cleaned up — see §5.4.
+
+Earlier versions wrote a `sessionActivity` sub-object into this same file. The current version **ignores** it on load and removes the stale sub-object on the next `set` write.
 
 ### 2.1.1 Enable DSH diagnostic logs
 
@@ -77,7 +81,7 @@ dsh-im uses DSH/Cordis's logger. To observe settings loading, sweeper startup, m
 
 Log levels are `0=error`, `1=info`, `2=warn`, and `3=debug`. dsh-im diagnostic logs are not automatically written into the repository; the console exporter writes to the Host stdout/stderr. In PowerShell, capture it with `pnpm dsh --profile <profile> "task" *> dsh-im-debug.log`.
 
-Timeout diagnostics include the settings path, resolved `enabled` value, threshold, scan interval, tracked count, touches, running-turn protection, cold-start grace, and expiry count. Feishu file diagnostics include short message/file identifiers, download stage, error code, final Session workspace, staging directory, and file count; file contents are never logged.
+Timeout diagnostics include the settings path, resolved `enabled` value, threshold, scan interval, tracked count, touches, running-turn protection, first-scan grace, and expiry count. Feishu file diagnostics include short message/file identifiers, download stage, error code, final Session workspace, staging directory, and file count; file contents are never logged.
 
 ### 2.2 Host config (cordis.yml injection)
 
@@ -208,15 +212,17 @@ Both touch points use fire-and-forget + try/catch: a tracking failure is only lo
 
 ### 5.2 Scanning
 
-Every `scanIntervalMs` (default 5 minutes, configurable), `scanAndExpire` iterates every entry in `sessionActivity`, and for any entry where `now - lastActivityAt > timeoutMinutes * 60000`, it runs `expire()`.
+Every `scanIntervalMs` (default 5 minutes, configurable), `scanAndExpire` iterates every conversationKey in the in-memory activity table, and for any entry where `now - lastActivityAt > timeoutMinutes * 60000`, it runs `expire()`. The scan neither reads nor writes disk.
 
 ### 5.3 Protection window (don't kill a long turn)
 
 Each tracked record also stores `runningSince` — the time the most recent agent turn started. During a scan, if `now - runningSince < replyTimeoutMs * 1.5` (default 10 min × 1.5 = 15 min), the entry is **skipped for this pass**, so a long turn does not get unbound mid-flight. Past the protection window the entry expires normally.
 
-### 5.4 Cold-start grace
+### 5.4 First-scan grace
 
-On a process restart, `sessionActivity` is rebuilt from the store. On the first scan, entries that are already past the threshold but with `age < thresholdMs + scanIntervalMs` are given a one-interval grace, so a restart does not immediately unbind a conversation whose user was about to come back. This is the same flakiness-avoidance philosophy as inbound-ttl's `TRACKED_PROTECTION_MS`.
+Because activity lives in memory only, every conversation starts out untracked after a process restart and its idle window is timed from scratch — a user who was away for eight hours gets a full threshold cycle after coming back instead of being unbound at boot.
+
+On top of that, one grace remains: on the first scan, entries that are already past the threshold but with `age < thresholdMs + scanIntervalMs` are given a one-interval grace, so an entry that aged past the line between two scans is not cleaned by the very first scan after (re)scheduling. This is the same flakiness-avoidance philosophy as inbound-ttl's `TRACKED_PROTECTION_MS`.
 
 ### 5.5 Notification text (when `notify=true`)
 
@@ -245,14 +251,14 @@ Set `enabled` back to `false` (or remove the `sessionTimeout` sub-object). After
 - Already-unbound conversations are not re-bound — the next user message starts a new Session;
 - Already-deleted files are not restored — this is a deliberate cleanup action.
 
-For one-off debugging, prefer **RPC `set enabled=false`** over editing the file: it avoids forcing the cold-start grace to re-evaluate on the next restart.
+For one-off debugging, prefer **RPC `set enabled=false`** over deleting the file: deleting it lets the next start re-initialize from host config / defaults.
 
 ## 8. Where the code lives
 
 | Path | Role |
 | --- | --- |
 | `src/channels/shared/session-timeout.mjs` | Pure functions: defaults, `normalizeSessionTimeoutSettings`, `validateSessionTimeoutField`, constants |
-| `src/channels/shared/session-timeout-store.mjs` | `SessionTimeoutStore`: persisted settings sub-object + `sessionActivity` sub-object, atomic write, ENOENT init, damage fallback |
+| `src/channels/shared/session-timeout-store.mjs` | `SessionTimeoutStore`: persisted settings sub-object (atomic write, ENOENT init, damage fallback); the activity table is memory-only and never persisted |
 | `src/channels/shared/bot-workspace-store.mjs` | `clearSessionDirectory` (called by the `directory`-tier cleanup) |
 | `plugin-src/host/session-timeout-service.mjs` | `createSessionTimeoutService`: scan, timeout detection, unbind, notify, file cleanup |
 | `plugin-src/host/session-timeout-runtime.mjs` | `getSessionTimeoutRuntime`: per-process singleton + `ctx.effect` teardown; `registerSessionTimeoutStateSource` / `registerSessionTimeoutWorkspaceProvider` |
@@ -269,7 +275,8 @@ For one-off debugging, prefer **RPC `set enabled=false`** over editing the file:
 - With `cleanupScope='inbound'`, the `<workspace>/.dsh-im/inbound/` subtree is gone, and the inbound-ttl-service next sweep does not error.
 - With `cleanupScope='directory'`, the `conv-*` directory is removed, the matching `sessionDirectories` entry in `workspaces.json` is dropped, and **the base workspace root is never deleted**.
 - A long-running turn is not unbound mid-flight (protection-window test).
-- On process restart, an entry that has expired but is still within the grace is not unbound immediately (cold-start test).
+- Activity records never appear in `settings.json`; after a restart each conversation's idle window is timed fresh (in-memory tests).
+- An entry that has expired but is still within the grace is not unbound by the first scan (grace test).
 - A single target's notification failure does not block the others or the unbind.
 - `session-timeout.get/set/expire-now` RPCs work; after a settings change the scan interval is rescheduled correctly.
 - **The old Session is not destroyed** — its persisted log is still on disk before and after the timeout; `/history` can access it.

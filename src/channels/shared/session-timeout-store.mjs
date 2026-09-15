@@ -1,8 +1,15 @@
-// Durable host-side settings and per-conversation activity log for session
-// timeout. Mirrors ./inbound-ttl-store.mjs: same atomic write discipline
-// (private temp file + rename), same damage-safe fallback (unreadable →
-// disabled), and the same settings.json document version so both features
-// share one file without a version bump.
+// Durable host-side settings for session timeout. Mirrors
+// ./inbound-ttl-store.mjs: same atomic write discipline (private temp file +
+// rename), same damage-safe fallback (unreadable → disabled), and the same
+// settings.json document version so both features share one file without a
+// version bump.
+//
+// The per-conversation activity log is intentionally NOT persisted: it is
+// runtime, ephemeral state and lives only in an in-memory Map. A restart
+// simply resets idle windows (a conversation must re-idle for the full
+// threshold before it is expired), which avoids flushing a growing set of
+// Feishu chat_id / open_id records into the user's settings.json on every
+// inbound message and turn-end event.
 
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
@@ -50,16 +57,17 @@ async function writeSettingsDocument(path, document) {
 /**
  * Durable host-side store for the conversation session-timeout feature.
  *
- * Two responsibilities live in one settings.json document:
+ * The settings.json document carries one responsibility:
  *   1. The `sessionTimeout` sub-object — runtime settings (`enabled`,
  *      `timeoutMinutes`, …) modified via the settings RPC.
- *   2. The `sessionActivity` sub-object — per-conversationKey activity
- *      records (`lastActivityAt`, `runningSince`, `sessionId`) touched by
- *      the service on every user message and turn-end event.
  *
- * The activity log is co-located with settings so a restart can rebuild the
- * pending-expiry view without a separate file; it is additive, so older
- * documents that lack it simply start every conversation as untracked.
+ * The per-conversationKey activity log (`lastActivityAt`, `runningSince`,
+ * `sessionId`) is kept in memory only. It is touched by the service on user
+ * messages and turn-end events — persisting that every time would rewrite
+ * settings.json per message — and a restart resetting idle windows is an
+ * acceptable, even friendlier, trade-off. A stale `sessionActivity` sub-object
+ * written by an older version is ignored on load and dropped on the next
+ * settings write.
  */
 export class SessionTimeoutStore {
   #path;
@@ -106,7 +114,6 @@ export class SessionTimeoutStore {
     }
     const read = this.#readDocument(raw);
     this.#settings = read.settings;
-    this.#activity = read.activity;
     this.#inboundTtlHours = read.inboundTtlHours;
     this.#wasFresh = read.fresh;
     await this.#removeStaleTemporaries();
@@ -132,9 +139,11 @@ export class SessionTimeoutStore {
   }
 
   /**
-   * Parse a settings document. Both `sessionTimeout` and `sessionActivity`
-   * are additive sub-objects: an absent or malformed either one falls back
-   * to its safe default rather than poisoning the whole store.
+   * Parse a settings document. `sessionTimeout` is additive: an absent or
+   * malformed sub-object falls back to its safe default rather than poisoning
+   * the whole store. A `sessionActivity` sub-object left by an older version
+   * is ignored here (activity lives in memory now) and dropped by the next
+   * settings write.
    *
    * @param {string} raw
    */
@@ -145,7 +154,6 @@ export class SessionTimeoutStore {
     } catch {
       return {
         settings: structuredClone(UNREADABLE_SESSION_TIMEOUT_SETTINGS),
-        activity: new Map(),
         inboundTtlHours: 168,
         fresh: false,
       };
@@ -153,7 +161,6 @@ export class SessionTimeoutStore {
     if (!document || typeof document !== 'object' || Array.isArray(document)) {
       return {
         settings: structuredClone(UNREADABLE_SESSION_TIMEOUT_SETTINGS),
-        activity: new Map(),
         inboundTtlHours: 168,
         fresh: false,
       };
@@ -163,7 +170,6 @@ export class SessionTimeoutStore {
     if (document.version !== DOCUMENT_VERSION) {
       return {
         settings: structuredClone(UNREADABLE_SESSION_TIMEOUT_SETTINGS),
-        activity: new Map(),
         inboundTtlHours: 168,
         fresh: false,
       };
@@ -172,33 +178,10 @@ export class SessionTimeoutStore {
     // the runtime can then seed host-config defaults as the initial values.
     const fresh = document.sessionTimeout === undefined;
     const settings = normalizeSessionTimeoutSettings(document.sessionTimeout);
-    const activity = this.#readActivity(document.sessionActivity);
     const inboundTtlHours = typeof document.inboundAttachmentTtlHours === 'number'
       ? document.inboundAttachmentTtlHours
       : 168;
-    return { settings, activity, inboundTtlHours, fresh };
-  }
-
-  #readActivity(raw) {
-    const activity = new Map();
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return activity;
-    for (const [key, value] of Object.entries(raw)) {
-      if (typeof key !== 'string' || !key) continue;
-      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-      const lastActivityAt = Number(value.lastActivityAt);
-      const sessionId = typeof value.sessionId === 'string' ? value.sessionId : undefined;
-      const botId = typeof value.botId === 'string' ? value.botId : undefined;
-      if (!Number.isFinite(lastActivityAt) || !botId) continue;
-      const record = {
-        botId,
-        ...(sessionId ? { sessionId } : {}),
-        lastActivityAt: Math.trunc(lastActivityAt),
-      };
-      const runningSince = Number(value.runningSince);
-      if (Number.isFinite(runningSince)) record.runningSince = Math.trunc(runningSince);
-      activity.set(key, record);
-    }
-    return activity;
+    return { settings, inboundTtlHours, fresh };
   }
 
   getSettings() {
@@ -223,12 +206,14 @@ export class SessionTimeoutStore {
       ...validated,
     });
     // Atomically persist the whole document so inbound-ttl's field survives.
+    // `sessionActivity` is deliberately absent: activity is memory-only, and
+    // rebuilding the document this way also drops any stale copy an older
+    // version left behind.
     await writeSettingsDocument(this.#path, {
       version: DOCUMENT_VERSION,
       ...(typeof this.#inboundTtlHours === 'number'
         ? { inboundAttachmentTtlHours: this.#inboundTtlHours } : {}),
       sessionTimeout: structuredClone(next),
-      ...(this.#activity.size > 0 ? { sessionActivity: this.#serializeActivity() } : {}),
     });
     this.#settings = structuredClone(next);
     return structuredClone(next);
@@ -247,8 +232,12 @@ export class SessionTimeoutStore {
   /**
    * Record activity on a conversation. `at` defaults to now; `runningSince`
    * hints the service's protection window is open so a long turn never gets
-   * expired mid-flight. Activity is flushed to disk so a restart can still
-   * see the pending expiry window.
+   * expired mid-flight.
+   *
+   * In-memory only, and awaited for API compatibility with callers that
+   * fire-and-forget `store.track(...).catch(...)`: this is called on every
+   * inbound message and every turn-end event, so it never touches the
+   * filesystem.
    */
   async track(key, { botId, sessionId, at = Date.now(), runningSince } = {}) {
     if (typeof key !== 'string' || !key || typeof botId !== 'string' || !botId) {
@@ -258,50 +247,10 @@ export class SessionTimeoutStore {
     if (typeof sessionId === 'string' && sessionId) record.sessionId = sessionId;
     if (Number.isFinite(runningSince)) record.runningSince = Math.trunc(runningSince);
     this.#activity.set(key, record);
-    await this.#persistActivity();
     return record;
   }
 
   async clearTracked(key) {
-    if (this.#activity.delete(key)) await this.#persistActivity();
-  }
-
-  /** Only persist the activity sub-tree; settings writes already touched disk. */
-  async #persistActivity() {
-    try {
-      const raw = await readFile(this.#path, 'utf8');
-      const document = JSON.parse(raw);
-      if (!document || typeof document !== 'object' || Array.isArray(document)) return;
-      if (this.#activity.size === 0) {
-        delete document.sessionActivity;
-      } else {
-        document.sessionActivity = this.#serializeActivity();
-      }
-      await writeSettingsDocument(this.#path, document);
-    } catch (error) {
-      if (error?.code === 'ENOENT') {
-        // First persistence: create the document the store owns stand-alone.
-        await writeSettingsDocument(this.#path, {
-          version: DOCUMENT_VERSION,
-          ...(typeof this.#inboundTtlHours === 'number'
-            ? { inboundAttachmentTtlHours: this.#inboundTtlHours } : {}),
-          sessionTimeout: structuredClone(this.#settings),
-          ...(this.#activity.size > 0 ? { sessionActivity: this.#serializeActivity() } : {}),
-        });
-      } else {
-        throw error;
-      }
-    }
-  }
-
-  #serializeActivity() {
-    const out = {};
-    for (const [key, record] of this.#activity.entries()) {
-      const value = { botId: record.botId, lastActivityAt: record.lastActivityAt };
-      if (record.sessionId) value.sessionId = record.sessionId;
-      if (Number.isFinite(record.runningSince)) value.runningSince = record.runningSince;
-      out[key] = value;
-    }
-    return out;
+    return this.#activity.delete(key);
   }
 }

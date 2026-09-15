@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Changed / 变更
+
+- 会话超时的每对话活动记录（`lastActivityAt` / `runningSince` / `sessionId`）不再写入 `settings.json`，只保留在内存 Map 中：`touch`（每条入站消息与每个回合结束）从此零磁盘 I/O，也消除了与 inbound-ttl 共享文档的高频读-改-写竞争，以及把 chat_id / open_id 固化进配置文件的问题。代价是重启后空闲窗口重新计时（用户回来后有完整一个阈值周期才被清理）。旧版本残留的 `sessionActivity` 子对象在读取时被忽略，并在下一次设置写盘时删除。
+  Session-timeout per-conversation activity records (`lastActivityAt` / `runningSince` / `sessionId`) are no longer persisted to `settings.json` and live only in an in-memory Map: `touch` (every inbound message and turn end) now performs zero disk I/O, removing the high-frequency read-modify-write race with the shared inbound-ttl document and the duplication of chat_id / open_id into the user's config file. The trade-off: a restart resets idle windows (a returning user gets a full threshold cycle before being cleaned). A stale `sessionActivity` sub-object from older versions is ignored on load and dropped on the next settings write.
+
 ### Added / 新增
 
 - 修复会话超时通知只尝试 Session Sync target、导致普通飞书私聊没有提示的问题：当 Session 没有注册的 sync target 时，现在按 `conversationKey` 回退到渠道主动消息入口；同时让 inbound TTL 与 session timeout 共用 `/dsh-im-settings` fetch route，避免两个 RPC 安装时发生 exact route 冲突。
@@ -17,8 +22,8 @@ This file records the notable changes in each dsh-im release. Its format follows
   - 配置层（`$DSH_HOME/integrations/dsh-im/settings.json` 中新增 `sessionTimeout` 子对象）：`enabled`、`timeoutMinutes`（默认 30，范围 1–10080）、`scanIntervalMs`（默认 5 分钟）、`cleanupScope`（默认 `none`，可选 `inbound`/`directory`）、`notify`（默认 true）、`notifyText`。Host config（cordis.yml）可设启动期默认；host 显式 `false` 为最终否决。损坏的 settings 文件回落到「禁用 + 默认阈值」，避免不可读的意图扩大为会话解绑。
     Configuration lives in a new `sessionTimeout` sub-object of `$DSH_HOME/integrations/dsh-im/settings.json`: `enabled`, `timeoutMinutes` (default 30, range 1–10080), `scanIntervalMs` (default 5 min), `cleanupScope` (default `none`, options `inbound`/`directory`), `notify` (default true), `notifyText`. Host config (cordis.yml) supplies startup defaults; an explicit host `false` is a hard veto. A damaged settings file falls back to "disabled + default threshold" so an unreadable intent can never widen into session unbinding.
 
-  - 与 `inbound-ttl-service` 共享同一份 `settings.json`，进程级单例（按 settings path 缓存）；扫描定时器复用 inbound-ttl 的 `setInterval + unref()` + `ctx.effect` 卸载骨架。运行中的 agent turn 通过 `runningSince` + `replyTimeoutMs * 1.5` 保护窗口避免误判；进程重启时给一个扫描间隔的冷启动 grace，避免重启即清理。
-    The feature shares `settings.json` with `inbound-ttl-service` and is a per-process singleton keyed by the settings path. The sweep timer reuses inbound-ttl's `setInterval + unref()` + `ctx.effect` teardown skeleton. An in-flight agent turn is shielded by a `runningSince` + `replyTimeoutMs * 1.5` protection window; on process restart, a one-scan-interval cold-start grace prevents immediate unbinding mid-recovery.
+  - 与 `inbound-ttl-service` 共享同一份 `settings.json`（仅设置子对象，活动记录不落盘），进程级单例（按 settings path 缓存）；扫描定时器复用 inbound-ttl 的 `setInterval + unref()` + `ctx.effect` 卸载骨架。运行中的 agent turn 通过 `runningSince` + `replyTimeoutMs * 1.5` 保护窗口避免误判；首轮扫描对一个扫描间隔宽限期内的条目放一马，避免恰在两次扫描之间越线的条目被立即清理。
+    The feature shares `settings.json` with `inbound-ttl-service` (the settings sub-object only; activity is never persisted) and is a per-process singleton keyed by the settings path. The sweep timer reuses inbound-ttl's `setInterval + unref()` + `ctx.effect` teardown skeleton. An in-flight agent turn is shielded by a `runningSince` + `replyTimeoutMs * 1.5` protection window; the first scan grants a one-scan-interval grace so an entry that aged past the line between two scans is not cleaned immediately.
 
   - 新增三个 `/dsh-im-settings` endpoints：`settings.session-timeout.get`、`.set`、`.expire-now`（手动触发指定 conversationKey 或全部立即过期），便于运维与测试。设置变更后扫描周期立即重排。
     Added three `/dsh-im-settings` endpoints: `settings.session-timeout.get`, `.set`, and `.expire-now` (manually expire one conversationKey or all of them), for ops and testing. Saving settings re-arms the sweep interval immediately.

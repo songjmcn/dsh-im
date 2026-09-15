@@ -20,10 +20,11 @@ const DEFAULT_SCAN_INTERVAL_MS = 5 * 60_000;
 // inbound-ttl-service's TRACKED_PROTECTION_MS philosophy: far above the
 // default reply timeout, after which protection expires on its own.
 const DEFAULT_REPLY_TIMEOUT_BUFFER_MS = 600_000 * 1.5;
-// A restarted process can rebuild pending expiries from the store's persisted
-// activity log. If an entry is already past the threshold but within the
-// grace window, the first scan lets it run once more so cold start does not
-// unbind on its way back up.
+// Activity is memory-only, so a restart starts every conversation untracked
+// and this grace window rarely applies anymore. It still covers the residual
+// case where an entry ages past the threshold between two scans and happens
+// to be caught by the very first scan after (re)scheduling: give it one more
+// cycle instead of unbinding on the opening sweep.
 const COLD_START_GRACE_MS_MULTIPLIER = 1;
 
 function settingsEnabled(settings) {
@@ -683,9 +684,9 @@ export function createSessionTimeoutService({
         });
         continue;
       }
-      // Cold-start grace: the first scan after start() on a per-process load
-      // lets already-expired entries live one more cycle so a restart does
-      // not unbind mid-recovery.
+      // First-scan grace: the first scan after start() gives an entry that
+      // aged past the threshold between two scans one more cycle instead of
+      // being unbound by the very first sweep after (re)scheduling.
       if (!scannedOnce
         && age < thresholdMs + effectiveScanIntervalMs() * COLD_START_GRACE_MS_MULTIPLIER) {
         logger.debug?.('[dsh-im] session timeout scan skipped: cold-start grace', {

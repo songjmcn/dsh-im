@@ -5,7 +5,7 @@
 // skipping when disabled).
 
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -136,7 +136,7 @@ test('SessionTimeoutStore loads defaults, round-trips patches, and backs off on 
   assert.equal(future.getSettings().enabled, false, 'unknown versions fall back to disabled');
 });
 
-test('SessionTimeoutStore tracks activity per conversationKey across reloads', async (t) => {
+test('SessionTimeoutStore keeps activity in memory and out of settings.json', async (t) => {
   const root = await directory(t, 'dsh-im-session-timeout-tracked-');
   const settingsPath = join(root, 'settings.json');
   const store = await new SessionTimeoutStore(settingsPath).load();
@@ -144,10 +144,32 @@ test('SessionTimeoutStore tracks activity per conversationKey across reloads', a
   assert.equal(store.getTracked('feishu:bot:openId')?.sessionId, 'sess-1');
   assert.equal(store.getTracked('feishu:bot:openId')?.lastActivityAt, 1_000);
 
+  // Activity is runtime state: touching it must never write settings.json.
+  await assert.rejects(readFile(settingsPath, 'utf8'), (error) => error.code === 'ENOENT');
+
+  // A restart starts with an empty activity view — idle windows reset.
   const reloaded = await new SessionTimeoutStore(settingsPath).load();
-  assert.equal(reloaded.getTracked('feishu:bot:openId')?.sessionId, 'sess-1');
-  await reloaded.clearTracked('feishu:bot:openId');
   assert.equal(reloaded.getTracked('feishu:bot:openId'), null);
+  await store.clearTracked('feishu:bot:openId');
+  assert.equal(store.getTracked('feishu:bot:openId'), null);
+});
+
+test('SessionTimeoutStore drops a stale sessionActivity block on the next settings write', async (t) => {
+  const root = await directory(t, 'dsh-im-session-timeout-stale-');
+  const settingsPath = join(root, 'settings.json');
+  // Written by an older version that persisted activity next to settings.
+  await mkdir(dirname(settingsPath), { recursive: true });
+  await writeFile(settingsPath, JSON.stringify({
+    version: 1,
+    sessionTimeout: { enabled: false, timeoutMinutes: 30 },
+    sessionActivity: { 'feishu:bot:openId': { botId: 'bot-1', lastActivityAt: 1 } },
+  }), 'utf8');
+
+  const store = await new SessionTimeoutStore(settingsPath).load();
+  assert.equal(store.getTracked('feishu:bot:openId'), null, 'stale activity is not rehydrated');
+  await store.setSettings({ enabled: true });
+  const persisted = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.equal(persisted.sessionActivity, undefined, 'stale activity is dropped on rewrite');
 });
 
 test('createSessionTimeoutService expires an idle conversation by unbinding the session', async () => {
