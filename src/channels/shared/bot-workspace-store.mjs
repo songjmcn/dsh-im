@@ -1319,6 +1319,69 @@ export class BotWorkspaceStore {
     });
   }
 
+  /**
+   * Forget the recorded session directory (and, when asked, the matching
+   * conversation-workspace override) for one conversation. Used by the
+   * session-timeout complete-tier cleanup after the disk directory has been
+   * removed: this method only touches in-memory state and the persisted
+   * `workspaces.json` document; it never deletes files. The caller is
+   * responsible for the on-disk removal first so a write failure here leaves
+   * "directory gone, record still present", which the next sweeper catches.
+   *
+   * Returns the removed directory record (or `null` when nothing was
+   * recorded) so callers can log or audit the outcome.
+   */
+  async clearSessionDirectory(botId, conversationKey, {
+    alsoClearWorkspaceOverride = false,
+    incarnation,
+  } = {}) {
+    const id = botIdOf(botId);
+    const key = conversationKeyOf(conversationKey);
+    if (!this.has(id)
+      || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+      const error = new Error('找不到要修改的机器人。');
+      error.code = 'workspace-bot-not-found';
+      throw error;
+    }
+    return this.#enqueue(id, async () => {
+      const previousDirectories = this.#sessionDirectories[id];
+      const hadDirectory = Boolean(previousDirectories)
+        && Object.hasOwn(previousDirectories, key);
+      if (!hadDirectory) return null;
+      const removed = previousDirectories[key];
+      const previousOverrides = this.#conversationWorkspaces[id];
+      const hadOverride = alsoClearWorkspaceOverride
+        && Boolean(previousOverrides) && Object.hasOwn(previousOverrides, key);
+      const removedOverride = hadOverride ? previousOverrides[key] : null;
+      const nextDirectories = { ...previousDirectories };
+      delete nextDirectories[key];
+      if (Object.keys(nextDirectories).length === 0) {
+        delete this.#sessionDirectories[id];
+      } else {
+        this.#sessionDirectories[id] = nextDirectories;
+      }
+      if (hadOverride) {
+        const nextOverrides = { ...previousOverrides };
+        delete nextOverrides[key];
+        if (Object.keys(nextOverrides).length === 0) {
+          delete this.#conversationWorkspaces[id];
+        } else {
+          this.#conversationWorkspaces[id] = nextOverrides;
+        }
+      }
+      try {
+        await this.#persist();
+      } catch (error) {
+        // Roll back the in-memory state so the next sweep can retry the write;
+        // the on-disk directory has already been removed by the caller.
+        this.#sessionDirectories[id] = previousDirectories;
+        if (hadOverride) this.#conversationWorkspaces[id] = previousOverrides;
+        throw error;
+      }
+      return { directory: removed.directory, override: removedOverride };
+    });
+  }
+
   async bindWorkspaceSession(botId, value, {
     conversationKey,
     sessionId,
@@ -2123,6 +2186,18 @@ export function createBotWorkspaceScope(
               },
               incarnation,
             }));
+        };
+      }
+      if (property === 'clearConversationSessionDirectory') {
+        return (conversationKey, options = {}) => {
+          if (!isCurrentScope()) {
+            const error = new Error('找不到要修改的机器人。');
+            error.code = 'workspace-bot-not-found';
+            return Promise.reject(error);
+          }
+          return workspaces.clearSessionDirectory(botId, conversationKey, {
+            alsoClearWorkspaceOverride: options.alsoClearWorkspaceOverride === true,
+          });
         };
       }
       if (property === 'bindWorkspaceSession') {

@@ -6,6 +6,43 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Added / 新增
+
+- 修复会话超时通知只尝试 Session Sync target、导致普通飞书私聊没有提示的问题：当 Session 没有注册的 sync target 时，现在按 `conversationKey` 回退到渠道主动消息入口；同时让 inbound TTL 与 session timeout 共用 `/dsh-im-settings` fetch route，避免两个 RPC 安装时发生 exact route 冲突。
+  Fixed session-timeout notices being limited to registered Session Sync targets, which left ordinary Feishu DMs without a notice. When no sync target exists, delivery now falls back to the channel's proactive conversation-key route. Inbound TTL and session timeout also share the `/dsh-im-settings` fetch route so their RPC installers no longer conflict.
+
+- 新增 IM 会话空闲超时能力：当某个会话最近一次用户输入或 agent 回合结束后空闲时长超过阈值，自动解绑 `conversationKey → sessionId`，下一条消息进来时不再沿用旧 Session，而是自动开一个全新 Session（新上下文）。**默认关闭**（`sessionTimeoutEnabled: false`），保留既有部署行为；开启后旧 Session 的持久化日志不删除、不销毁，`/history` 仍可访问。会话超时只清「绑定 + 可选临时文件」，不动 session log 本身。
+  Added an IM conversation idle-timeout feature: when a conversation has been idle past a configured threshold since its last user input or agent turn end, the `conversationKey → sessionId` binding is automatically unbound; the next incoming message starts a fresh Session (a new context) instead of reusing the previous one. **Default off** (`sessionTimeoutEnabled: false`) so existing deployments behave unchanged. The old Session's persisted log is never deleted or destroyed — `/history` still works. Session timeout only clears the binding (and optional temporary files); it never touches the session log itself.
+
+  - 配置层（`$DSH_HOME/integrations/dsh-im/settings.json` 中新增 `sessionTimeout` 子对象）：`enabled`、`timeoutMinutes`（默认 30，范围 1–10080）、`scanIntervalMs`（默认 5 分钟）、`cleanupScope`（默认 `none`，可选 `inbound`/`directory`）、`notify`（默认 true）、`notifyText`。Host config（cordis.yml）可设启动期默认；host 显式 `false` 为最终否决。损坏的 settings 文件回落到「禁用 + 默认阈值」，避免不可读的意图扩大为会话解绑。
+    Configuration lives in a new `sessionTimeout` sub-object of `$DSH_HOME/integrations/dsh-im/settings.json`: `enabled`, `timeoutMinutes` (default 30, range 1–10080), `scanIntervalMs` (default 5 min), `cleanupScope` (default `none`, options `inbound`/`directory`), `notify` (default true), `notifyText`. Host config (cordis.yml) supplies startup defaults; an explicit host `false` is a hard veto. A damaged settings file falls back to "disabled + default threshold" so an unreadable intent can never widen into session unbinding.
+
+  - 与 `inbound-ttl-service` 共享同一份 `settings.json`，进程级单例（按 settings path 缓存）；扫描定时器复用 inbound-ttl 的 `setInterval + unref()` + `ctx.effect` 卸载骨架。运行中的 agent turn 通过 `runningSince` + `replyTimeoutMs * 1.5` 保护窗口避免误判；进程重启时给一个扫描间隔的冷启动 grace，避免重启即清理。
+    The feature shares `settings.json` with `inbound-ttl-service` and is a per-process singleton keyed by the settings path. The sweep timer reuses inbound-ttl's `setInterval + unref()` + `ctx.effect` teardown skeleton. An in-flight agent turn is shielded by a `runningSince` + `replyTimeoutMs * 1.5` protection window; on process restart, a one-scan-interval cold-start grace prevents immediate unbinding mid-recovery.
+
+  - 新增三个 `/dsh-im-settings` endpoints：`settings.session-timeout.get`、`.set`、`.expire-now`（手动触发指定 conversationKey 或全部立即过期），便于运维与测试。设置变更后扫描周期立即重排。
+    Added three `/dsh-im-settings` endpoints: `settings.session-timeout.get`, `.set`, and `.expire-now` (manually expire one conversationKey or all of them), for ops and testing. Saving settings re-arms the sweep interval immediately.
+
+  - 入站文件 ingress 与 Session-sync-coordinator 的 `turn/end` 路径会调 `service.touchBySessionId(sessionId)` 重置空闲窗口；失败仅记日志，不影响消息收发。
+    The inbound file-ingress path and Session-sync-coordinator's `turn/end` handler call `service.touchBySessionId(sessionId)` to reset the idle window; failures are logged and never affect message delivery.
+
+  - 通知文案默认「会话超时，已开启新会话；如需继续上一段，请使用 /history」，走 dsh-im 既有 i18n 字典，不硬编码；通知通过 `deliveryService.sendSessionSyncText` 投递，单 target 失败不阻断其他 target 或解绑动作。
+    The default notify text "会话超时，已开启新会话；如需继续上一段，请使用 /history" goes through dsh-im's existing i18n dictionary, not hardcoded literals. Notifications are sent via `deliveryService.sendSessionSyncText`; a single target's failure never blocks the other targets or the unbinding itself.
+
+  - 与既有 `inbound-ttl-service` 正交：会话超时清理是一次性即时动作，长期附件淘汰仍由 inbound-ttl 周期 sweep 负责；二者不相互取消，会话超时清理后该 workspace 下无 inbound 目录时 inbound sweep 自然无操作。
+    Orthogonal to `inbound-ttl-service`: session-timeout cleanup is a one-shot immediate action, long-term attachment eviction still belongs to inbound-ttl's periodic sweep. They never cancel each other; once a session-timeout cleanup empties an inbound subtree, inbound-ttl's sweep simply has nothing to do there.
+
+  - 默认 `cleanupScope: 'none'`（只解绑上下文，不清理文件）；`'inbound'` 档仅清 `inbound/` 子树；`'directory'` 档（完整档）需走四级安全校验（路径形态匹配、不等于 base workspace 根、`realpathSync` 仍位于 `record.base` 之下、名称符合会话目录命名规则），任一失败降级而非删除，并绝不删除 base workspace 根目录。
+    `cleanupScope` defaults to `'none'` (unbind only, no file cleanup). `'inbound'` sweeps the `inbound/` subtree only. `'directory'` (the full tier) requires four safety checks (path-shape match, not equal to the base workspace root, `realpathSync` still under `record.base`, name matches the conversation-directory naming rule); any failure degrades instead of deleting, and the base workspace root is never removed.
+
+  - `'inbound'` 档复用 `sweepInboundAttachments(workspace, 0, { isTracked: () => false })`，以 TTL=0 语义强制清空记录目录与（如有会话目录隔离）base 工作区下的 `inbound/` 子树。`'directory'` 档先做磁盘删除（`rm -rf`），再让新增的 `BotWorkspaceStore.clearSessionDirectory(botId, conversationKey, { alsoClearWorkspaceOverride })` 从 `workspaces.json` 移除 `sessionDirectories` 条目（及可选的 `conversationWorkspaces` 覆盖）。harness scope 也暴露 `clearConversationSessionDirectory(conversationKey, options)` 走同一路径。`workspaces.json` 写盘失败不回滚磁盘删除，记「directory gone, record still present」，下次扫描二次清理并告警。
+    The `'inbound'` tier reuses `sweepInboundAttachments(workspace, 0, { isTracked: () => false })` so a TTL=0 sweep clears the recorded directory (and, when conversation directory isolation applies, the base workspace's `inbound/` subtree too). The `'directory'` tier performs the disk removal first (`rm -rf`), then asks the new `BotWorkspaceStore.clearSessionDirectory(botId, conversationKey, { alsoClearWorkspaceOverride })` to drop the `sessionDirectories` entry (and the optional `conversationWorkspaces` override) from `workspaces.json`. The harness scope exposes `clearConversationSessionDirectory(conversationKey, options)` over the same path. A `workspaces.json` write failure here is not rolled back; the documented "directory gone, record still present" state is left, and the next sweep retries the cleanup and warns.
+
+### Changed / 变更
+
+- 文件清理档位（`'inbound'` 与 `'directory'`）作为可选增强：MVP 默认 `cleanupScope: 'none'`，仅解绑 `conversationKey → sessionId`，下一条消息自动开新 Session。文件清理、目录删除均为可选附加动作，且与解绑独立——即使文件清理失败，解绑仍然完成。
+    The file-cleanup scopes (`'inbound'` and `'directory'`) are optional enhancements. The MVP default `cleanupScope: 'none'` only unbinds `conversationKey → sessionId`; the next message starts a new Session automatically. File cleanup and directory removal are optional add-on actions independent of the unbinding — a cleanup failure still leaves the unbinding complete.
+
 ## [4.20.0] - 2026-09-12
 
 ### Added / 新增

@@ -92,6 +92,7 @@ export async function askInWorkspaceSession({
   deferredDelivery,
   logger = console,
   onConversationDirectory,
+  onSessionResolved,
 }) {
   const initialTitle = contextEnhanced
     ? initialSessionTitle({
@@ -150,6 +151,23 @@ export async function askInWorkspaceSession({
         return { sessionId, session };
       });
       if (!binding) continue;
+      // Notify the host that a session is live for this conversation. The
+      // session-timeout service uses this hook to reset the idle window for
+      // every message, including pure-text messages that never reach the
+      // file-ingress path. Fire-and-forget: a tracking failure must never
+      // block the prompt.
+      if (typeof onSessionResolved === 'function') {
+        try {
+          const result = onSessionResolved(key, binding.sessionId);
+          if (result && typeof result.then === 'function') {
+            void result.catch((error) => {
+              logger?.warn?.('[dsh-im] session-timeout touch failed:', error?.message ?? error);
+            });
+          }
+        } catch (error) {
+          logger?.warn?.('[dsh-im] session-timeout touch failed:', error?.message ?? error);
+        }
+      }
       const artifacts = [];
       const originalOnArtifact = typeof askOptions === 'object'
         && typeof askOptions?.onArtifact === 'function'
