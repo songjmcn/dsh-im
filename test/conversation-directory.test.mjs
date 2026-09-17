@@ -15,8 +15,15 @@ import {
 } from '../src/channels/shared/conversation-directory.mjs';
 import { ensureConversationDirectory } from '../src/channels/shared/conversation-directory-ensure.mjs';
 import { resetConversationSession } from '../src/channels/shared/new-command.mjs';
-import { BotWorkspaceStore, createBotWorkspaceScope } from '../src/channels/shared/bot-workspace-store.mjs';
-import { workspacePathSnapshot } from '../src/channels/shared/workspace-command.mjs';
+import { BotWorkspaceStore, createBotWorkspaceScope, createWorkspaceAwareController } from '../src/channels/shared/bot-workspace-store.mjs';
+import {
+  validConversationDirectoryDefaultPayload,
+  validConversationDirectoryPayload,
+} from '../plugin-src/host/channels/shared/conversation-directory-rpc.mjs';
+import {
+  runWorkspaceCommand,
+  workspacePathSnapshot,
+} from '../src/channels/shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../src/channels/shared/workspace-session.mjs';
 
 async function fixture(t) {
@@ -526,4 +533,160 @@ test('the workspace list hides derived conversation directories unless asked', a
   assert.ok(!hidden.paths.includes(directory), 'a conversation directory is hidden');
   const shown = await workspacePathSnapshot(harness, { includeSessionDirectories: true });
   assert.ok(shown.paths.includes(directory), '/workspacelist all shows them again');
+});
+
+test('the workspace list filter follows a custom isolation prefix', async (t) => {
+  const { workspace, root } = await fixture(t);
+  const isoDirectory = join(workspace, 'iso-p2p-ou_abc-deadbeef');
+  const defaultNamed = join(workspace, `${CONVERSATION_DIRECTORY_PREFIX}p2p-ou_abc-1a2b3c4d`);
+  await Promise.all([
+    mkdir(isoDirectory, { recursive: true }),
+    mkdir(defaultNamed, { recursive: true }),
+  ]);
+  const harness = {
+    async listWorkspaces() { return [workspace, isoDirectory, defaultNamed]; },
+    currentWorkspace: () => workspace,
+    assertWorkspaceScope() {},
+    conversationDirectorySettings: () => ({ enabled: true, strategy: 'per-conversation', prefix: 'iso-' }),
+  };
+  const hidden = await workspacePathSnapshot(harness);
+  assert.ok(!hidden.paths.includes(isoDirectory), 'custom-prefix directory is hidden');
+  assert.ok(hidden.paths.includes(defaultNamed), 'a conv- path is not treated as this deployment’s directory');
+});
+
+// ── Manual workspace lock while isolation is on ───────────────────────────────
+
+async function isolatedStoreFixture(t) {
+  const { workspace, path, root } = await fixture(t);
+  await writeFile(path, `${JSON.stringify({
+    version: 3,
+    workspaces: { bot_one: workspace },
+    conversationDirectories: { bot_one: { enabled: true } },
+  }, null, 2)}\n`);
+  const store = await new BotWorkspaceStore(path, { defaultWorkspace: workspace }).load();
+  return { workspace, path, root, store };
+}
+
+test('isolation locks manual bot and conversation workspace writes', async (t) => {
+  const { workspace, store } = await isolatedStoreFixture(t);
+  const alternate = join(workspace, '..', 'alternate');
+  await mkdir(alternate, { recursive: true });
+  await assert.rejects(
+    () => store.setWorkspace('bot_one', alternate),
+    (error) => error?.code === 'workspace-manual-edit-disabled',
+  );
+  await assert.rejects(
+    () => store.setConversationWorkspace('bot_one', 'p2p:ou_abc', alternate),
+    (error) => error?.code === 'workspace-manual-edit-disabled',
+  );
+  assert.equal(store.workspaceFor('bot_one'), workspace);
+  assert.equal(store.conversationWorkspaceFor('bot_one', 'p2p:ou_abc'), workspace);
+});
+
+test('isolation does not block applyConversationSessionDirectory', async (t) => {
+  const { workspace, store } = await isolatedStoreFixture(t);
+  const directory = join(workspace, 'conv-p2p-ou_abc-1a2b3c4d');
+  await mkdir(directory);
+  const applied = await store.applyConversationSessionDirectory('bot_one', 'p2p:ou_abc', {
+    base: workspace,
+    directory,
+    strategy: 'per-conversation',
+  }, { token: store.publishConversationWorkspaceSwitch('bot_one', 'p2p:ou_abc') });
+  assert.equal(applied, directory);
+  assert.equal(store.sessionDirectoryFor('bot_one', 'p2p:ou_abc').directory, directory);
+});
+
+test('/workspace and /conv are silent while isolation is on', async (t) => {
+  const { workspace, store } = await isolatedStoreFixture(t);
+  const baseHarness = {
+    async listWorkspaces() { return [workspace]; },
+    currentWorkspace: () => workspace,
+    async switchWorkspace() { throw new Error('must not switch'); },
+    async switchConversationWorkspace() { throw new Error('must not switch conversation'); },
+    async clearConversationWorkspace() { throw new Error('must not clear conversation'); },
+  };
+  const scope = createBotWorkspaceScope(baseHarness, {
+    botId: 'bot_one',
+    workspaces: store,
+    state: { sessionFor: () => null, async setSession() {}, async clearSession() {} },
+  });
+  const key = 'p2p:ou_abc';
+  for (const command of ['/workspace 1', '/ws /abs/path', '/conv', '/conv /abs/path', '/conv clear', '/thread']) {
+    const result = await runWorkspaceCommand(command, scope.harness, key);
+    assert.equal(result?.handled, true, `${command} is handled`);
+    assert.equal(result.message, '', `${command} stays silent`);
+    assert.deepEqual(result.messages, []);
+  }
+  assert.equal(store.workspaceFor('bot_one'), workspace);
+});
+
+test('/workspace still works when isolation is off', async (t) => {
+  const { workspace, path } = await fixture(t);
+  const alternate = join(workspace, '..', 'alternate');
+  await mkdir(alternate, { recursive: true });
+  const store = await new BotWorkspaceStore(path, { defaultWorkspace: workspace }).load();
+  await store.ensure('bot_one', { workspace });
+  const scope = createBotWorkspaceScope({
+    async listWorkspaces() { return [workspace, alternate]; },
+    currentWorkspace: () => store.workspaceFor('bot_one'),
+    async switchWorkspace(next) { return store.setWorkspace('bot_one', next); },
+  }, {
+    botId: 'bot_one',
+    workspaces: store,
+    state: { sessionFor: () => null, async setSession() {}, async clearSession() {}, async clearSessions() {} },
+  });
+  const result = await runWorkspaceCommand(`/workspace ${alternate}`, scope.harness, 'p2p:ou_abc');
+  assert.match(result.message, /工作区已切换为/);
+  assert.equal(store.workspaceFor('bot_one'), alternate);
+});
+
+// ── Channel-wide default RPC surface ─────────────────────────────────────────
+
+test('channel-default payload accepts a full config or an explicit clear', () => {
+  assert.equal(validConversationDirectoryDefaultPayload({
+    config: { enabled: true },
+  }), true);
+  assert.equal(validConversationDirectoryDefaultPayload({ config: null }), true);
+  assert.equal(validConversationDirectoryDefaultPayload({ config: { enabled: 'yes' } }), false);
+  assert.equal(validConversationDirectoryDefaultPayload({ botId: 'bot_one', config: { enabled: true } }), false);
+  assert.equal(validConversationDirectoryPayload({ botId: 'bot_one', config: { enabled: true } }), true);
+});
+
+test('updateConversationDirectoryDefault applies to bots without a per-bot override', async (t) => {
+  const { workspace, path } = await fixture(t);
+  const store = await new BotWorkspaceStore(path, { defaultWorkspace: workspace }).load();
+  await store.ensure('bot_one', { workspace });
+  await store.ensure('bot_two', { workspace });
+  await store.setConversationDirectorySettings('bot_two', { enabled: false });
+
+  const core = {
+    async status() {
+      return {
+        bots: [
+          { botId: 'bot_one', connected: true },
+          { botId: 'bot_two', connected: true },
+        ],
+      };
+    },
+  };
+  const controller = createWorkspaceAwareController(core, {
+    workspaces: store,
+    stateFor: async () => ({
+      async clearSessions() {},
+      async clearSession() {},
+      async setSession() {},
+    }),
+  });
+
+  const updated = await controller.updateConversationDirectoryDefault({ enabled: true });
+  assert.equal(store.defaultConversationDirectorySettings()?.enabled, true);
+  assert.equal(store.conversationDirectorySettingsFor('bot_one').enabled, true);
+  assert.equal(store.conversationDirectorySettingsFor('bot_two').enabled, false, 'per-bot override wins');
+  assert.equal(updated.conversationDirectoryDefault.enabled, true);
+  assert.equal(updated.bots.find((bot) => bot.botId === 'bot_one')?.conversationDirectory?.enabled, true);
+  assert.equal(updated.bots.find((bot) => bot.botId === 'bot_two')?.conversationDirectory?.enabled, false);
+
+  await controller.updateConversationDirectoryDefault(null);
+  assert.equal(store.defaultConversationDirectorySettings(), null);
+  assert.equal(store.conversationDirectorySettingsFor('bot_one').enabled, false);
 });

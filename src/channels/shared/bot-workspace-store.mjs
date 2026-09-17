@@ -49,6 +49,24 @@ function workspaceSessionStale(message) {
   return error;
 }
 
+/** Manual workspace edits are a no-go while conversation-directory isolation is on. */
+export const WORKSPACE_MANUAL_EDIT_DISABLED = 'workspace-manual-edit-disabled';
+
+/** `/session` may only adopt a Session that already lives in the isolated directory. */
+export const SESSION_WORKSPACE_MISMATCH = 'session-workspace-mismatch';
+
+function workspaceManualEditDisabledError() {
+  const error = new Error('已开启会话目录隔离，无法手动修改工作区。');
+  error.code = WORKSPACE_MANUAL_EDIT_DISABLED;
+  return error;
+}
+
+function sessionWorkspaceMismatchError() {
+  const error = new Error('该会话不在当前对话的隔离工作区内。');
+  error.code = SESSION_WORKSPACE_MISMATCH;
+  return error;
+}
+
 async function canonicalWorkspacePath(value) {
   return resolve(await realpath(value));
 }
@@ -609,6 +627,15 @@ export class BotWorkspaceStore {
     return { ...DEFAULT_CONVERSATION_DIRECTORY_SETTINGS };
   }
 
+  /**
+   * True when conversation-directory isolation is in force for this bot.
+   * Manual workspace writes (`/workspace`, `/conv`, settings UI) must refuse
+   * in that mode: the conversation directory owns the cwd.
+   */
+  manualWorkspaceEditLocked(botId) {
+    return this.conversationDirectorySettingsFor(botId).enabled === true;
+  }
+
   /** The channel-wide switch, or null when the deployment never set one. */
   defaultConversationDirectorySettings() {
     return this.#conversationDirectory ? { ...this.#conversationDirectory } : null;
@@ -863,6 +890,7 @@ export class BotWorkspaceStore {
       error.code = 'workspace-bot-not-found';
       throw error;
     }
+    if (this.manualWorkspaceEditLocked(id)) throw workspaceManualEditDisabledError();
     const workspace = await validateWorkspacePath(value);
     return this.#enqueue(id, async () => {
       if (!this.has(id)
@@ -907,6 +935,7 @@ export class BotWorkspaceStore {
       error.code = 'workspace-bot-not-found';
       throw error;
     }
+    if (this.manualWorkspaceEditLocked(id)) throw workspaceManualEditDisabledError();
     const token = this.publishConversationWorkspaceSwitch(id, conversationKey);
     return this.applyConversationWorkspaceSwitch(id, conversationKey, value, {
       token,
@@ -1392,13 +1421,17 @@ export class BotWorkspaceStore {
     incarnation,
     expectedGeneration,
     expectedConversationGeneration,
+    lockWorkspaceAlignment = false,
   } = {}) {
     const id = botIdOf(botId);
     if (typeof conversationKey !== 'string' || !conversationKey
       || typeof sessionId !== 'string' || !sessionId) {
       throw new TypeError('conversationKey and sessionId are required');
     }
-    if (typeof clearSessions !== 'function' || typeof setSession !== 'function') {
+    if (typeof setSession !== 'function') {
+      throw new TypeError('session state callbacks are required');
+    }
+    if (!lockWorkspaceAlignment && typeof clearSessions !== 'function') {
       throw new TypeError('session state callbacks are required');
     }
     if (!this.has(id)
@@ -1437,6 +1470,24 @@ export class BotWorkspaceStore {
       // workspace switch queued while the session was being adopted must not be
       // silently overwritten by the binding that started before it.
       assertConversationCurrent();
+      if (lockWorkspaceAlignment) {
+        // Isolation mode: the Session must already live in this conversation's
+        // effective workspace. Adopting it must not move bot default, conversation
+        // override, or the recorded session directory.
+        const effective = this.conversationWorkspaceFor(id, conversationKey);
+        if (!(await sameWorkspacePath(workspace, effective))) {
+          throw sessionWorkspaceMismatchError();
+        }
+        assertConversationCurrent();
+        await setSession(conversationKey, sessionId);
+        assertConversationCurrent();
+        return {
+          workspace: effective,
+          sessionId,
+          generation: this.#generations.get(id),
+          conversationGeneration,
+        };
+      }
       const sameWorkspace = await sameWorkspacePath(workspace, this.workspaceFor(id));
       const previousOverrides = this.#conversationWorkspaces[id];
       const override = previousOverrides?.[conversationKey];
@@ -1621,6 +1672,9 @@ export class BotWorkspaceStore {
             : {}),
         }
         : bot),
+      ...(this.#conversationDirectory
+        ? { conversationDirectoryDefault: { ...this.#conversationDirectory } }
+        : {}),
     };
   }
 
@@ -2081,6 +2135,9 @@ export function createBotWorkspaceScope(
             error.code = 'workspace-bot-not-found';
             return Promise.reject(error);
           }
+          if (workspaces.manualWorkspaceEditLocked(botId)) {
+            return Promise.reject(workspaceManualEditDisabledError());
+          }
           return workspaces.setWorkspace(botId, workspace, {
             clearSessions: () => state.clearSessions(),
             incarnation,
@@ -2121,6 +2178,9 @@ export function createBotWorkspaceScope(
             error.code = 'workspace-bot-not-found';
             return Promise.reject(error);
           }
+          if (workspaces.manualWorkspaceEditLocked(botId)) {
+            return Promise.reject(workspaceManualEditDisabledError());
+          }
           const token = workspaces.publishConversationWorkspaceSwitch(botId, conversationKey);
           maskConversationSwitch(conversationKey, token);
           return trackConversationSwitch(conversationKey, workspaces.applyConversationWorkspaceSwitch(botId, conversationKey, workspace, {
@@ -2141,6 +2201,9 @@ export function createBotWorkspaceScope(
             const error = new Error('找不到要修改的机器人。');
             error.code = 'workspace-bot-not-found';
             return Promise.reject(error);
+          }
+          if (workspaces.manualWorkspaceEditLocked(botId)) {
+            return Promise.reject(workspaceManualEditDisabledError());
           }
           const token = workspaces.publishConversationWorkspaceSwitch(botId, conversationKey);
           maskConversationSwitch(conversationKey, token);
@@ -2247,6 +2310,7 @@ export function createBotWorkspaceScope(
             incarnation,
             expectedGeneration,
             expectedConversationGeneration,
+            lockWorkspaceAlignment: workspaces.manualWorkspaceEditLocked(botId),
           });
           if (!isCurrentScope()) {
             const error = new Error('找不到要修改的机器人。');
@@ -2725,6 +2789,31 @@ export function createWorkspaceAwareController(controller, {
       return result;
     });
   };
+  /**
+   * Channel-wide isolation default. Bots without a saved per-bot override
+   * inherit it; `null` clears the default and returns those bots to off.
+   */
+  const updateConversationDirectoryDefault = (value, projectStatus) => (async () => {
+    const settings = value === null ? null : validateConversationDirectorySettings(value);
+    const snapshot = await controller.status();
+    await workspaces.setDefaultConversationDirectorySettings(settings);
+    const decorated = workspaces.decorateStatus(snapshot);
+    const updated = {
+      ...decorated,
+      ...(settings
+        ? { conversationDirectoryDefault: { ...settings } }
+        : {}),
+      bots: decorated.bots.map((bot) => bot?.botId
+        ? {
+          ...bot,
+          ...(Object.hasOwn(bot, 'conversationDirectory') || settings
+            ? { conversationDirectory: workspaces.conversationDirectorySettingsFor(bot.botId) }
+            : {}),
+        }
+        : bot),
+    };
+    return projectStatus ? await projectStatus(updated) : updated;
+  })();
   const deleteWithWorkspace = (botId, invokeDelete) => withBotTransition(botId, async () => {
     // Fence the old runtime without changing the durable mapping. A crash
     // before the controller removes its config therefore keeps the bot's
@@ -2769,6 +2858,9 @@ export function createWorkspaceAwareController(controller, {
       if (property === 'updateContextEnhancement') return updateContextEnhancement;
       if (property === 'updateAccessPolicy') return updateAccessPolicy;
       if (property === 'updateConversationDirectory') return updateConversationDirectory;
+      if (property === 'updateConversationDirectoryDefault') {
+        return updateConversationDirectoryDefault;
+      }
       const value = Reflect.get(target, property, target);
       if (typeof value !== 'function') return value;
       if (property === 'deleteBot') {

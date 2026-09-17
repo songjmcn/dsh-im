@@ -53,14 +53,17 @@ The name is derived from the conversation key alone, so a restart or another mac
 
 ## Interaction with the workspace commands
 
-| Command | Behaviour |
-| --- | --- |
-| `/conv <path>` | That path becomes the **base** Workspace; the next new Session gets a directory below it. `/conv <an existing conversation directory>` pins the conversation to that directory instead |
-| `/conv clear` | Back to the bot default Workspace; a new directory is derived there on the next new Session |
-| `/conv` (no argument) | Shows the current conversation workspace, the directory that was created automatically and its base |
-| `/session <id>` | Binding an existing Session aligns the conversation with that Session's real working directory — an explicit bind wins, and the conversation stops being isolated automatically |
-| `/workspacelist` | Hides automatically created conversation directories by default, so one conversation does not add one row |
-| `/workspacelist all` | Lists every workspace, including conversation directories |
+While isolation is on, the conversation **owns** its working directory: every manual workspace write is refused (including at the store/RPC layer, with `workspace-manual-edit-disabled`).
+
+| Command | Isolation on | Isolation off |
+| --- | --- | --- |
+| `/workspace` `/ws` | **No response** | Switches the bot default Workspace |
+| `/conv` `/conversation` `/thread` | **No response** (set / clear / status) | Views, sets or clears the conversation Workspace |
+| `/session <id>` | Only adopts a Session that already lives in this conversation's effective Workspace (the isolated directory); never changes any Workspace setting. Sessions from another Workspace are rejected | Aligns workspaces as before |
+| `/workspacelist` | Available; hides conversation directories by default | Same |
+| `/workspacelist all` | Lists every workspace, including conversation directories | Same |
+| `/new` | Available (prepares or reuses the directory) | Same, without directory preparation |
+| Settings Workspace editor | **Locked** | Editable |
 
 ## When it cannot apply
 
@@ -72,7 +75,7 @@ Remove the `conversationDirectory` section (or set `enabled` back to `false`) an
 
 - no new directory is created;
 - directories and files already created are **left untouched** — the plugin never deletes them;
-- conversations already running in their directory keep using it (it is now their workspace override); send `/conv clear` to return one to the bot default Workspace.
+- conversations already running in their directory keep using it (it is now their workspace override); send `/conv clear` only **after** isolation is off to return one to the bot default Workspace.
 
 ## Where the code lives
 

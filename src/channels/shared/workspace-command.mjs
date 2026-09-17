@@ -30,6 +30,24 @@ function commandResult(message, messages = [message]) {
   return { handled: true, message, messages };
 }
 
+/**
+ * True when conversation-directory isolation owns this bot's cwd. Read failures
+ * fail closed so a broken settings read cannot reopen manual workspace edits.
+ */
+function conversationDirectoryIsolationEnabled(harness) {
+  if (typeof harness?.conversationDirectorySettings !== 'function') return false;
+  try {
+    return harness.conversationDirectorySettings()?.enabled === true;
+  } catch {
+    return true;
+  }
+}
+
+/** Handled but silent: the command does not exist in isolation mode. */
+function isolationLockedCommandResult() {
+  return { handled: true, message: '', messages: [] };
+}
+
 function normalizedWorkspacePath(value) {
   if (typeof value !== 'string' || value.length > MAX_WORKSPACE_PATH_LENGTH
     || !isAbsolute(value) || UNSAFE_DISPLAY_TEXT.test(value)) return null;
@@ -124,9 +142,17 @@ export async function workspacePathSnapshot(harness, options = {}) {
   // unfiltered list grows one row per conversation and buries the operator's
   // real workspaces. The bot's own workspace always survives; a caller that
   // needs the raw set (`/workspacelist all`) opts back in.
+  let directoryPrefix;
+  try {
+    directoryPrefix = options.sessionDirectoryPrefix
+      ?? harness?.conversationDirectorySettings?.()?.prefix;
+  } catch {
+    directoryPrefix = options.sessionDirectoryPrefix;
+  }
   const visible = includeSessionDirectories
     ? paths
-    : paths.filter((path) => path === current || !isConversationDirectoryPath(path));
+    : paths.filter((path) => path === current
+      || !isConversationDirectoryPath(path, directoryPrefix ? { prefix: directoryPrefix } : undefined));
   return { current: current ?? null, paths: visible };
 }
 
@@ -334,6 +360,14 @@ function sessionBindErrorMessage(error) {
   if (error?.code === 'workspace-bot-not-found') {
     return t('机器人正在移除或已重新接入，无法绑定原对话的会话。');
   }
+  if (error?.code === 'session-workspace-mismatch') {
+    // Isolation mode: silent, matching /conv and /workspace. The mismatch path
+    // is only reachable for an explicit Session ID outside the conversation directory.
+    return null;
+  }
+  if (error?.code === 'workspace-manual-edit-disabled') {
+    return null;
+  }
   if ([WORKSPACE_SESSION_STALE, 'agent-busy', 'session-conflict', 'workspace-conflict']
     .includes(error?.code)) {
     return t('工作区或会话状态已发生变化，请重试。');
@@ -403,11 +437,15 @@ async function runSessionBindCommand(command, harness, conversationKey) {
     ].join('\n');
     return commandResult(message, splitWorkspaceCommandMessage(message));
   } catch (error) {
-    return commandResult(sessionBindErrorMessage(error));
+    const message = sessionBindErrorMessage(error);
+    return message === null ? isolationLockedCommandResult() : commandResult(message);
   }
 }
 
 async function runConversationWorkspaceCommand(command, harness, conversationKey) {
+  if (conversationDirectoryIsolationEnabled(harness)) {
+    return isolationLockedCommandResult();
+  }
   if (typeof harness?.currentConversationWorkspace !== 'function') {
     return commandResult(t('当前机器人暂不支持按对话设置专属工作区。'));
   }
@@ -512,6 +550,9 @@ export async function runWorkspaceCommand(text, harness, conversationKey) {
   if (listMatch) return runWorkspaceListCommand(listMatch, harness);
   const match = WORKSPACE_COMMAND.exec(command);
   if (!match) return null;
+  if (conversationDirectoryIsolationEnabled(harness)) {
+    return isolationLockedCommandResult();
+  }
   const workspace = match[1]?.trim();
   if (!workspace) {
     return commandResult(t('用法：/workspace 工作区序号或绝对路径'));

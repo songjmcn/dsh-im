@@ -33,6 +33,7 @@ export const FEISHU_ENDPOINTS = Object.freeze({
   setAgentPreset: "bot.preset.set",
   setContextEnhancement: "bot.context-enhancement.set",
   setConversationDirectory: "bot.conversation-directory.set",
+  setConversationDirectoryDefault: "bot.conversation-directory.default.set",
   setAccessPolicy: "bot.access-policy.set",
   setAlias: 'bot.alias.set',
   setGroupResponseMode: "bot.group-response-mode.set",

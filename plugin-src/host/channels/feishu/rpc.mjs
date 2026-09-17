@@ -18,7 +18,10 @@ import { publicWorkspaceError, validWorkspacePayload } from '../shared/workspace
 import { validAgentPresetPayload } from '../shared/agent-preset-rpc.mjs';
 import { validModelPayload } from '../shared/model-setting-rpc.mjs';
 import { validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
-import { validConversationDirectoryPayload } from '../shared/conversation-directory-rpc.mjs';
+import {
+  validConversationDirectoryPayload,
+  validConversationDirectoryDefaultPayload,
+} from '../shared/conversation-directory-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
 import { normalizeContextEnhancementConfig } from '../../../../src/channels/shared/context-enhancement.mjs';
 import {
@@ -464,6 +467,10 @@ function validPayload(endpoint, payload) {
     return validConversationDirectoryPayload(payload)
       ? null : '请输入有效的会话目录设置。';
   }
+  if (endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault) {
+    return validConversationDirectoryDefaultPayload(payload)
+      ? null : '请输入有效的渠道默认会话目录设置。';
+  }
   if (endpoint === FEISHU_ENDPOINTS.setGroupResponseMode) {
     return hasOnlyKeys(payload, new Set(['botId', 'groupResponseMode']))
       && safeOpaqueId(payload.botId)
@@ -773,6 +780,14 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
         value = await toPublicFeishuStatus(
           await controller.updateConversationDirectory(payload.botId, payload.config),
           { encodeQr: cachedEncodeQr },
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setConversationDirectoryDefault) {
+        if (typeof controller.updateConversationDirectoryDefault !== 'function') {
+          throw new Error('Conversation directory default update is unavailable');
+        }
+        value = await controller.updateConversationDirectoryDefault(
+          payload.config,
+          (status) => toPublicFeishuStatus(status, { encodeQr: cachedEncodeQr }),
         );
       } else if (endpoint === FEISHU_ENDPOINTS.setGroupResponseMode) {
         if (typeof controller.updateGroupResponseMode !== 'function') {

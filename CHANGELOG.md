@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Added / 新增
+
+- 会话目录隔离开启后，锁定全部**手动工作区写路径**：`/workspace` `/ws`、`/conv`（含别名）不响应；Store/RPC 拒绝 `workspace-manual-edit-disabled`；设置页工作区编辑器锁定。`/session` 改为仅可绑定当前对话有效工作区（隔离目录）内的会话，且不改任何工作区配置。`/workspacelist` 过滤支持自定义前缀。Host RPC：`bot.conversation-directory.set`（按 bot）与 `bot.conversation-directory.default.set`（渠道默认，`config:null` 清除）。
+  While conversation-directory isolation is on, every **manual workspace write** is locked: `/workspace` `/ws` and `/conv` (aliases included) stay silent; the store/RPC layer rejects with `workspace-manual-edit-disabled`; the settings Workspace editor is locked. `/session` only adopts a Session already inside the conversation's effective (isolated) Workspace and never changes workspace settings. `/workspacelist` filtering honours a custom prefix. Host RPCs: `bot.conversation-directory.set` (per bot) and `bot.conversation-directory.default.set` (channel default; `config: null` clears it).
+
 ### Changed / 变更
 
 - 会话超时的每对话活动记录（`lastActivityAt` / `runningSince` / `sessionId`）不再写入 `settings.json`，只保留在内存 Map 中：`touch`（每条入站消息与每个回合结束）从此零磁盘 I/O，也消除了与 inbound-ttl 共享文档的高频读-改-写竞争，以及把 chat_id / open_id 固化进配置文件的问题。代价是重启后空闲窗口重新计时（用户回来后有完整一个阈值周期才被清理）。旧版本残留的 `sessionActivity` 子对象在读取时被忽略，并在下一次设置写盘时删除。

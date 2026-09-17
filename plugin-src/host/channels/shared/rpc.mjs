@@ -2,7 +2,9 @@ import { SET_ALIAS_ENDPOINT, validAliasPayload } from './bot-alias-rpc.mjs';
 import { registerManagementRpc } from '../../../management-rpc.mjs';
 import {
   SET_CONVERSATION_DIRECTORY_ENDPOINT,
+  SET_CONVERSATION_DIRECTORY_DEFAULT_ENDPOINT,
   validConversationDirectoryPayload,
+  validConversationDirectoryDefaultPayload,
 } from './conversation-directory-rpc.mjs';
 import { SET_CONTEXT_ENHANCEMENT_ENDPOINT, validContextEnhancementPayload } from './context-enhancement-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from './access-policy-rpc.mjs';
@@ -31,6 +33,7 @@ export const TOKEN_BOT_ENDPOINTS = Object.freeze({
   setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
   setAlias: SET_ALIAS_ENDPOINT,
   setConversationDirectory: SET_CONVERSATION_DIRECTORY_ENDPOINT,
+  setConversationDirectoryDefault: SET_CONVERSATION_DIRECTORY_DEFAULT_ENDPOINT,
 });
 
 const ENDPOINTS = Object.freeze(Object.values(TOKEN_BOT_ENDPOINTS));
@@ -104,6 +107,10 @@ function payloadFailure(endpoint, payload) {
   if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectory) {
     return validConversationDirectoryPayload(payload)
       ? null : '请输入有效的会话目录设置。';
+  }
+  if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectoryDefault) {
+    return validConversationDirectoryDefaultPayload(payload)
+      ? null : '请输入有效的渠道默认会话目录设置。';
   }
   return 'Unknown bot endpoint.';
 }
@@ -204,6 +211,11 @@ export function createTokenBotRpcHandler(controller, { channel }) {
       } else if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectory) {
         if (typeof controller.updateConversationDirectory !== 'function') throw new Error('Conversation directory update is unavailable');
         value = await controller.updateConversationDirectory(payload.botId, payload.config);
+      } else if (endpoint === TOKEN_BOT_ENDPOINTS.setConversationDirectoryDefault) {
+        if (typeof controller.updateConversationDirectoryDefault !== 'function') {
+          throw new Error('Conversation directory default update is unavailable');
+        }
+        value = await controller.updateConversationDirectoryDefault(payload.config);
       } else {
         value = await controller.deleteBot(payload.botId);
       }
