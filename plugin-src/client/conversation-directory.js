@@ -87,13 +87,26 @@ export function ConversationDirectoryEditor({
   const title = SCOPE_TITLES[scope] ?? SCOPE_TITLES.bot;
   const showClear = scope === 'channel' && typeof onClear === 'function';
   const showFields = enabled || (scope === 'bot' && hasOverride);
+  const helpId = React.useId();
+  const helpText = scope === 'channel'
+    ? '影响本渠道全部无覆盖的机器人。开启后 /workspace、/conv 与手动改工作区不可用。'
+    : '开启后工作目录按对话自动派生；/workspace、/conv 与手动改工作区不可用；/session 仅可绑定本目录内会话。';
 
   return h('div', {
     className: 'dim-conversationDirectory',
     'data-conversation-directory-scope': scope,
   },
-    h('div', { className: 'dim-workspaceHeader' },
-      h('span', null, title),
+    h('div', { className: 'dim-conversationDirectoryHeader' },
+      h('span', { className: 'dim-conversationDirectoryTitle' },
+        h('span', null, title),
+        h('span', { className: 'dim-conversationDirectoryHelp' },
+          h('button', {
+            type: 'button',
+            className: 'dim-conversationDirectoryHelpButton',
+            'aria-label': '查看会话目录隔离说明',
+            'aria-describedby': helpId,
+          }, h('span', { 'aria-hidden': 'true' }, '?')),
+          h('span', { id: helpId, className: 'dim-conversationDirectoryTooltip', role: 'tooltip' }, helpText))),
       h('label', { className: 'dim-contextSwitchRow' },
         h('span', { className: 'dim-contextSwitchLabel' }, enabled ? '已开启' : '已关闭'),
         h('input', {
@@ -137,12 +150,7 @@ export function ConversationDirectoryEditor({
           onBlur: () => {
             if (prefix !== settings.prefix) void save({ enabled, strategy, prefix });
           },
-        })),
-      h('div', { className: 'dim-summary' },
-        scope === 'channel'
-          ? '影响本渠道全部无覆盖的机器人。开启后 /workspace、/conv 与手动改工作区不可用。'
-          : '开启后工作目录按对话自动派生；/workspace、/conv 与手动改工作区不可用；/session 仅可绑定本目录内会话。'),
-    ) : null,
+        }))) : null,
     showClear
       ? h('div', { className: 'dim-conversationDirectoryActions' },
           h('button', {

@@ -47,9 +47,22 @@ export function WorkspaceEditor({
     }
   }, [close, locked, onSave, workspace]);
 
+  const helpId = React.useId();
+
   return h('div', { className: 'dim-workspace' },
     h('div', { className: 'dim-workspaceHeader' },
-      h('span', null, '当前工作区'),
+      h('span', { className: 'dim-workspaceTitle' },
+        h('span', null, '当前工作区'),
+        directoryIsolation
+          ? h('span', { className: 'dim-workspaceHelp' },
+              h('button', {
+                type: 'button',
+                className: 'dim-workspaceHelpButton',
+                'aria-label': '查看工作区隔离说明',
+                'aria-describedby': helpId,
+              }, h('span', { 'aria-hidden': 'true' }, '?')),
+              h('span', { id: helpId, className: 'dim-workspaceTooltip', role: 'tooltip' }, '已开启会话目录隔离，工作区由对话自动派生，无法手动修改。'))
+          : null),
       h('button', {
         type: 'button',
         ref: editButtonRef,
@@ -57,9 +70,6 @@ export function WorkspaceEditor({
         onClick: () => { setOpen(true); setError(null); },
         disabled: locked || !activeDirectoryPicker,
       }, '选择目录')),
-    directoryIsolation
-      ? h('div', { className: 'dim-workspaceIsolationNote' }, '已开启会话目录隔离，工作区由对话自动派生，无法手动修改。')
-      : null,
     workspace
       ? React.createElement('code', {
           className: 'dim-workspacePath',
