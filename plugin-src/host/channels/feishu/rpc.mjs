@@ -24,6 +24,7 @@ import {
 } from '../shared/conversation-directory-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
 import { normalizeContextEnhancementConfig } from '../../../../src/channels/shared/context-enhancement.mjs';
+import { normalizeConversationDirectorySettings } from '../../../../src/channels/shared/conversation-directory.mjs';
 import {
   isFeishuGroupResponseMode,
   normalizeFeishuGroupResponseMode,
@@ -314,6 +315,11 @@ function publicBotEntry(entry) {
     health: publicHealth(source, connected),
   };
   if (typeof source.workspace === 'string' && source.workspace) result.workspace = source.workspace;
+  // Only projected when the store decorated isolation settings: deployments that
+  // never opted in keep the exact browser payload they had before.
+  if (source.conversationDirectory && typeof source.conversationDirectory === 'object') {
+    result.conversationDirectory = normalizeConversationDirectorySettings(source.conversationDirectory);
+  }
   const lastMessageError = publicMessageFailure(source.lastMessageError);
   if (lastMessageError) result.lastMessageError = lastMessageError;
   const error = publicError(source.error);
@@ -362,6 +368,11 @@ export async function toPublicFeishuStatus(status, { encodeQr = qrCodeDataUrl } 
   };
   if (provisioning) snapshot.provisioning = provisioning;
   if (error) snapshot.error = error;
+  if (source.conversationDirectoryDefault && typeof source.conversationDirectoryDefault === 'object') {
+    snapshot.conversationDirectoryDefault = normalizeConversationDirectorySettings(
+      source.conversationDirectoryDefault,
+    );
+  }
   return snapshot;
 }
 

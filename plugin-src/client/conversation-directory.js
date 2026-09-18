@@ -13,11 +13,27 @@ const STRATEGY_LABELS = Object.freeze({
   'per-session': '每会话一个目录',
 });
 
+const SCOPE_TITLES = Object.freeze({
+  bot: '会话目录隔离',
+  channel: '渠道默认 · 会话目录隔离',
+});
+
 /**
  * Compact isolation switch: enabled / strategy / prefix. Saves as one atomic
  * config object so a damaged field never leaves a half-written toggle.
+ *
+ * `scope: 'channel'` targets the channel-wide default (no botId). `scope: 'bot'`
+ * writes a per-bot override; when `hasOverride` is false the card only displays
+ * the inherited channel default and a follow control.
  */
-export function ConversationDirectoryEditor({ config, disabled = false, onSave }) {
+export function ConversationDirectoryEditor({
+  config,
+  scope = 'bot',
+  hasOverride = true,
+  disabled = false,
+  onSave,
+  onClear,
+}) {
   const settings = normalizeConversationDirectorySettings(config);
   const [enabled, setEnabled] = React.useState(settings.enabled);
   const [strategy, setStrategy] = React.useState(settings.strategy);
@@ -54,11 +70,30 @@ export function ConversationDirectoryEditor({ config, disabled = false, onSave }
     }
   }, [onSave]);
 
-  const busy = disabled || saving;
+  const clear = React.useCallback(async () => {
+    if (typeof onClear !== 'function') return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onClear();
+    } catch (cause) {
+      setError(cause?.message ?? '清除渠道默认失败，请重试。');
+    } finally {
+      setSaving(false);
+    }
+  }, [onClear]);
 
-  return h('div', { className: 'dim-conversationDirectory' },
+  const busy = disabled || saving;
+  const title = SCOPE_TITLES[scope] ?? SCOPE_TITLES.bot;
+  const showClear = scope === 'channel' && typeof onClear === 'function';
+  const showFields = enabled || (scope === 'bot' && hasOverride);
+
+  return h('div', {
+    className: 'dim-conversationDirectory',
+    'data-conversation-directory-scope': scope,
+  },
     h('div', { className: 'dim-workspaceHeader' },
-      h('span', null, '会话目录隔离'),
+      h('span', null, title),
       h('label', { className: 'dim-contextSwitchRow' },
         h('span', { className: 'dim-contextSwitchLabel' }, enabled ? '已开启' : '已关闭'),
         h('input', {
@@ -73,7 +108,10 @@ export function ConversationDirectoryEditor({ config, disabled = false, onSave }
             void save({ enabled: nextEnabled, strategy, prefix });
           },
         }))),
-    enabled ? h('div', { className: 'dim-conversationDirectoryFields' },
+    scope === 'bot' && !hasOverride
+      ? h('div', { className: 'dim-summary' }, '未覆盖 · 当前继承渠道默认；打开开关可单独为本机器人覆盖。')
+      : null,
+    showFields ? h('div', { className: 'dim-conversationDirectoryFields' },
       h('label', { className: 'dim-conversationDirectoryField' },
         h('span', null, '策略'),
         h('select', {
@@ -101,8 +139,19 @@ export function ConversationDirectoryEditor({ config, disabled = false, onSave }
           },
         })),
       h('div', { className: 'dim-summary' },
-        '开启后工作目录按对话自动派生；/workspace、/conv 与手动改工作区不可用；/session 仅可绑定本目录内会话。'),
+        scope === 'channel'
+          ? '影响本渠道全部无覆盖的机器人。开启后 /workspace、/conv 与手动改工作区不可用。'
+          : '开启后工作目录按对话自动派生；/workspace、/conv 与手动改工作区不可用；/session 仅可绑定本目录内会话。'),
     ) : null,
+    showClear
+      ? h('div', { className: 'dim-conversationDirectoryActions' },
+          h('button', {
+            type: 'button',
+            className: 'dim-workspaceEdit',
+            disabled: busy,
+            onClick: () => { void clear(); },
+          }, '清除渠道默认'))
+      : null,
     error ? h('div', { className: 'dim-summary dim-cardFeedback', role: 'alert' }, error) : null,
   );
 }

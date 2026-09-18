@@ -4,7 +4,9 @@ import QRCode from 'qrcode';
 import { SET_CONTEXT_ENHANCEMENT_ENDPOINT, validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
 import {
   SET_CONVERSATION_DIRECTORY_ENDPOINT,
+  SET_CONVERSATION_DIRECTORY_DEFAULT_ENDPOINT,
   validConversationDirectoryPayload,
+  validConversationDirectoryDefaultPayload,
 } from '../shared/conversation-directory-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
 import { resolveRpcAuthority } from '../../rpc-authority.mjs';

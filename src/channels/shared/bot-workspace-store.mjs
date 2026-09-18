@@ -2798,12 +2798,13 @@ export function createWorkspaceAwareController(controller, {
     const snapshot = await controller.status();
     await workspaces.setDefaultConversationDirectorySettings(settings);
     const decorated = workspaces.decorateStatus(snapshot);
+    const bots = Array.isArray(decorated?.bots) ? decorated.bots : [];
     const updated = {
       ...decorated,
       ...(settings
         ? { conversationDirectoryDefault: { ...settings } }
         : {}),
-      bots: decorated.bots.map((bot) => bot?.botId
+      bots: bots.map((bot) => bot?.botId
         ? {
           ...bot,
           ...(Object.hasOwn(bot, 'conversationDirectory') || settings

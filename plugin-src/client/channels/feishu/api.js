@@ -290,6 +290,13 @@ export function normalizeBotsSnapshot(value) {
     error: normalizeError(value.error),
     agentPresetCatalog: normalizeAgentPresetCatalog(value.agentPresetCatalog),
     modelCatalog: normalizeModelCatalog(value.modelCatalog),
+    ...(Object.hasOwn(value, "conversationDirectoryDefault")
+      ? {
+        conversationDirectoryDefault: normalizeConversationDirectorySettings(
+          value.conversationDirectoryDefault,
+        ),
+      }
+      : {}),
   };
 }
 
