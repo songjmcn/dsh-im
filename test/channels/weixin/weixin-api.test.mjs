@@ -261,6 +261,101 @@ test('sendText preserves safe iLink business rejection codes', async (t) => {
   }
 });
 
+test('sendText retries a connection-level failure with the same client id', async () => {
+  const bodies = [];
+  const api = createWeixinApi({
+    fetchImpl: async (url, init) => {
+      bodies.push(JSON.parse(init.body));
+      if (bodies.length === 1) throw new TypeError('fetch failed');
+      return jsonResponse({ ret: 0 });
+    },
+  });
+
+  const result = await api.sendText({
+    baseUrl: 'https://ilinkai.weixin.qq.com',
+    token: 'host-only-token',
+    toUserId: 'wx-user',
+    text: 'Harness reply',
+    contextToken: 'message-context',
+  });
+
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].msg.client_id, bodies[1].msg.client_id);
+  assert.deepEqual(result.providerMessageIds, [bodies[0].msg.client_id]);
+});
+
+test('sendText gives up after three attempts when the connection keeps failing', async () => {
+  let attempts = 0;
+  const api = createWeixinApi({
+    fetchImpl: async () => {
+      attempts += 1;
+      throw new TypeError('fetch failed');
+    },
+  });
+
+  await assert.rejects(
+    api.sendText({
+      baseUrl: 'https://ilinkai.weixin.qq.com',
+      token: 'host-only-token',
+      toUserId: 'wx-user',
+      text: 'Harness reply',
+    }),
+    (error) => error instanceof WeixinApiError && error.code === 'network-error',
+  );
+  assert.equal(attempts, 3);
+});
+
+test('sendText does not retry failures that may already have been delivered', async (t) => {
+  for (const scenario of [
+    { name: 'provider rejection', response: () => jsonResponse({ ret: -2 }), code: 'send-rejected' },
+    { name: 'http error', response: () => jsonResponse({}, { status: 500 }), code: 'http-error' },
+  ]) {
+    await t.test(scenario.name, async () => {
+      let attempts = 0;
+      const api = createWeixinApi({
+        fetchImpl: async () => {
+          attempts += 1;
+          return scenario.response();
+        },
+      });
+
+      await assert.rejects(
+        api.sendText({
+          baseUrl: 'https://ilinkai.weixin.qq.com',
+          token: 'host-only-token',
+          toUserId: 'wx-user',
+          text: 'Harness reply',
+        }),
+        (error) => error instanceof WeixinApiError && error.code === scenario.code,
+      );
+      assert.equal(attempts, 1);
+    });
+  }
+});
+
+test('sendText stops retrying when the caller aborts during the back-off', async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const api = createWeixinApi({
+    fetchImpl: async () => {
+      attempts += 1;
+      throw new TypeError('fetch failed');
+    },
+  });
+
+  const pending = api.sendText({
+    baseUrl: 'https://ilinkai.weixin.qq.com',
+    token: 'host-only-token',
+    toUserId: 'wx-user',
+    text: 'Harness reply',
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(new Error('cancelled')), 100);
+
+  await assert.rejects(pending, (error) => error.message === 'cancelled');
+  assert.equal(attempts, 1);
+});
+
 test('getConfig requests a typing ticket for the current Weixin conversation', async () => {
   const calls = [];
   const api = createWeixinApi({

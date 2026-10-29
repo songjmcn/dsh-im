@@ -144,7 +144,7 @@ export async function createProductionController(ctx, config = {}, internals = {
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
     imageInputPolicy: () => getImageInputSettingsStore(config).get(),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const coreController = new Controller({
     credentials: ctx.credentials,
     configStore: observedConfigStore,
@@ -157,6 +157,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         initialAccessPolicy: initialAccessPolicyFor('wecom-app', botConfig),
       });
       const workspaceScope = createBotWorkspaceScope(harness, {
+        dsBot: config.deliveryService?.dsBot,
         botId, workspaces, state, agentPresetCatalog,
       });
       return new Runtime({
@@ -207,7 +208,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   }).start();
   return {
     controller,
-    deliveryAdapter: createDeliveryAdapter({
+    deliveryAdapter: createDeliveryAdapter({ dsBot: config.deliveryService?.dsBot,
       channel: 'wecom-app', workspaces, coreController, stateFor,
     }),
     ready: supervisor.ready,

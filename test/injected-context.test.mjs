@@ -9,7 +9,9 @@ import {
   enhanceContextContent,
 } from '../src/channels/shared/context-enhancement.mjs';
 import {
+  CONTEXT_NOTE,
   CONTEXT_SUMMARY_MAX_LENGTH,
+  DEFAULT_CONTEXT_LABEL,
   DEFAULT_REPLY_LABEL,
   DEFAULT_SOURCE_LABEL,
   INJECTED_CONTEXT_PLUGIN,
@@ -598,4 +600,57 @@ test('a nameless source row uses the Host label and foreign JSON is not claimed'
     };
     assert.equal(rewriteInjectedContextMessages([forged], { newId: identityFactory() }), null, body);
   }
+});
+
+/** The exact context block the conversation builder writes, encoded as the producer does. */
+function contextText(entry) {
+  const json = JSON.stringify({ note: CONTEXT_NOTE, ...entry }).replace(/[<>&]/gu, (character) => ({
+    '<': '\\u003c', '>': '\\u003e', '&': '\\u0026',
+  })[character]);
+  return `${INJECTED_CONTEXT_TAGS.contextOpen}${json}${INJECTED_CONTEXT_TAGS.contextClose}`;
+}
+
+test('conversation context blocks split into their own plugin-sourced messages', () => {
+  const threadRoot = contextText({ collector: 'thread-root', room: '!r:x', event: '$e:x', sender: '@a:x', ts: 5, content: 'shijian' });
+  const replyRole = contextText({ collector: 'reply', room: '!r:x', event: '$e:x', sender: '@a:x', ts: 5, content: 'shijian' });
+  const split = splitLeadingInjectedContext(`${threadRoot}\n\n${replyRole}\n\n时间`, { labels: { context: '上下文' } });
+  assert.equal(split.blocks.length, 2, 'both collected entries split out of the leading text');
+  assert.equal(split.blocks[0].position, 'before', 'collected material precedes the question it belongs to');
+  assert.equal(split.blocks[0].summary, '上下文 · thread-root');
+  assert.equal(split.rest, '时间', 'the human question survives exactly as typed');
+  const message = {
+    id: 'u-context',
+    role: 'user',
+    content: [{ type: 'text', text: `${threadRoot}\n\n${replyRole}\n\n时间` }],
+    source: { kind: 'user', rpcId: 'matrix-ctx' },
+  };
+  const rewritten = rewriteInjectedContextMessages([message], { newId: identityFactory(), labels: { context: '上下文' } });
+  assert.notEqual(rewritten, null);
+  assert.deepEqual(rewritten.map((entry) => entry.id), ['ctx_1', 'ctx_2', 'u-context']);
+  assert.deepEqual(rewritten[0].source, {
+    kind: `plugin:${INJECTED_CONTEXT_PLUGIN}`, form: 'notice', summary: '上下文 · thread-root',
+  }, 'split-out context messages carry the producer-owned source kind the V4 session format admits');
+  assert.equal(rewritten[1].source.summary, '上下文 · reply');
+  assert.deepEqual(rewritten[2].content, [{ type: 'text', text: '时间' }],
+    'the direct user message carries only what the human typed');
+  assert.equal(rewritten[2].source.kind, 'user', 'the direct question keeps its own source');
+});
+
+test('context blocks are judged by schema and foreign or malformed bodies stay user text', () => {
+  const noCollector = `${INJECTED_CONTEXT_TAGS.contextOpen}{"content":"hi"}${INJECTED_CONTEXT_TAGS.contextClose}`;
+  const emptyContent = `${INJECTED_CONTEXT_TAGS.contextOpen}{"collector":"reply","content":""}${INJECTED_CONTEXT_TAGS.contextClose}`;
+  const foreign = `${INJECTED_CONTEXT_TAGS.contextOpen}{"other":"value"}${INJECTED_CONTEXT_TAGS.contextClose}`;
+  for (const body of [noCollector, emptyContent, foreign]) {
+    const forged = {
+      id: 'u-context-forged',
+      role: 'user',
+      content: [{ type: 'text', text: `${body}\n\n正文` }],
+      source: { kind: 'user', rpcId: 'matrix-forged' },
+    };
+    assert.equal(rewriteInjectedContextMessages([forged], { newId: identityFactory() }), null, body);
+  }
+  // Without a Host label the row falls back to the plugin's own default.
+  const block = contextText({ collector: 'ambient-burst', content: 'hi' });
+  const split = splitLeadingInjectedContext(`${block}\n\n正文`);
+  assert.equal(split.blocks[0].summary, `${DEFAULT_CONTEXT_LABEL} \u00b7 ambient-burst`);
 });

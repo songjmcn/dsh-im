@@ -1,6 +1,7 @@
-import { connectionHint, extractConnectionEvidence } from './connection-error.mjs';
+import { isSessionNotFound } from './session-error.mjs';
+import { connectionHint, extractConnectionEvidence, messageDiagnosticError, runtimeDiagnosticDetails } from './connection-error.mjs';
+import { createFailureReferenceId } from './delivery-failure-log.mjs';
 import { diagnosticFields } from './diagnostic-details.mjs';
-import { randomUUID } from 'node:crypto';
 
 import { t } from './i18n.mjs';
 
@@ -26,6 +27,8 @@ const PROVIDER_FAILURES = Object.freeze({
 });
 
 const FAILURE_MESSAGES = Object.freeze({
+  HARNESS_INTERACTION_TIMEOUT:
+    '与 DSH 的交互通道在 30 秒内未就绪，本条消息尚未提交执行。请稍后重试。',
   HARNESS_CONNECT:
     '无法连接处理服务，消息尚未提交。请确认 DeepSeek Harness 正在运行后重试。',
   HARNESS_TIMEOUT:
@@ -72,8 +75,10 @@ const FAILURE_MESSAGES = Object.freeze({
     '任务被意外中断，本次未完成。请重试。',
   SESSION_NOT_FOUND:
     '当前会话已不存在。请发送 /new 创建新会话后重试。',
+  SESSION_UNREADABLE:
+    '当前会话日志已损坏，无法继续读取。请先到 DSH 查看任务状态，再发送 /new 创建新会话；原会话记录会保留。',
   SESSION_ARCHIVED:
-    '当前会话已归档，无法继续处理。请在 DSH 中取消归档，或发送 /new 创建新会话。',
+    '当前会话已归档，无法继续处理。有命令权限时可发送 /new 创建新会话；否则请联系管理员在 DSH 中取消归档，或为你开启命令权限。',
   SESSION_BUSY:
     '当前会话仍在处理上一项任务。请等待完成，或发送 /stop 后重试。',
   SESSION_STALE:
@@ -107,18 +112,23 @@ function providerFailureCode(error) {
   return PROVIDER_FAILURES[value.trim().toUpperCase()] ?? null;
 }
 
-function failureCode(error) {
+function failureCode(error, details) {
   const code = typeof error?.code === 'string' ? error.code : '';
   const providerCode = providerFailureCode(error);
   if (providerCode) return providerCode;
+  if (code === 'harness-interaction-timeout') return 'HARNESS_INTERACTION_TIMEOUT';
+
+  const uncertain = details.submissionState === undefined
+    ? ['session.prompt', 'session.history'].includes(error?.method)
+    : details.submissionState !== 'not-submitted';
 
   if (code === 'harness-connect-failed') {
-    return ['session.prompt', 'session.history'].includes(error?.method)
+    return uncertain
       ? 'HARNESS_RESULT_UNCERTAIN'
       : 'HARNESS_CONNECT';
   }
   if (code === 'harness-timeout') {
-    return ['session.prompt', 'session.history'].includes(error?.method)
+    return uncertain
       ? 'HARNESS_RESULT_UNCERTAIN'
       : 'HARNESS_TIMEOUT';
   }
@@ -138,7 +148,8 @@ function failureCode(error) {
   if (code === 'model-max-tokens') return 'MODEL_OUTPUT_LIMIT';
   if (code === 'turn-blocked') return 'TURN_BLOCKED';
   if (['turn-interrupted', 'turn-aborted'].includes(code)) return 'TURN_INTERRUPTED';
-  if (code === 'session-not-found') return 'SESSION_NOT_FOUND';
+  if (isSessionNotFound(code)) return 'SESSION_NOT_FOUND';
+  if (code === 'session-unreadable') return 'SESSION_UNREADABLE';
   if (code === 'session-archived') return 'SESSION_ARCHIVED';
   if (code === 'agent-busy') return 'SESSION_BUSY';
   if (code === 'workspace-session-stale') return 'SESSION_STALE';
@@ -190,7 +201,7 @@ function transportFailureCode(error, details) {
 function safeReferenceId(value) {
   return typeof value === 'string' && /^[A-Z0-9-]{6,40}$/u.test(value)
     ? value
-    : `MF-${randomUUID().slice(0, 8).toUpperCase()}`;
+    : createFailureReferenceId();
 }
 
 function safeFailureReason(value) {
@@ -205,25 +216,38 @@ export function classifyMessageFailure(error, {
   at = Date.now(),
 } = {}) {
   const safeReason = safeFailureReason(reason);
-  const classifiedCode = failureCode(error);
+  const details = extractConnectionEvidence(error).details;
+  const classifiedCode = failureCode(error, details);
   const businessCode = classifiedCode === 'INTERNAL_UNKNOWN'
     && safeReason
     && typeof userMessage === 'string'
     && userMessage.trim()
     ? 'INPUT_INVALID'
     : classifiedCode;
-  const details = extractConnectionEvidence(error).details;
   const code = businessCode === 'INTERNAL_UNKNOWN'
     ? transportFailureCode(error, details)
     : businessCode;
   if (code === 'REQUEST_TIMEOUT' || code === 'NETWORK_ERROR') details.hint = connectionHint(details);
+  if (details.stage || details.submissionState) Object.assign(details, runtimeDiagnosticDetails());
+  let message = FAILURE_MESSAGES[code];
+  if (['INTERNAL_UNKNOWN', 'REQUEST_TIMEOUT', 'NETWORK_ERROR'].includes(code)) {
+    if (details.submissionState === 'not-submitted') {
+      message = code === 'REQUEST_TIMEOUT'
+        ? '消息提交前的操作超时，本条消息尚未提交执行。请稍后重试。'
+        : code === 'NETWORK_ERROR'
+          ? '消息提交前的网络请求失败，本条消息尚未提交执行。请检查连接后重试。'
+          : '消息在提交前处理失败，尚未提交执行。请重试；若持续发生，请将参考号提供给管理员。';
+    } else if (details.submissionState) {
+      message = '消息已尝试提交，但任务结果尚未确认。请先到 DSH 查看状态，不要立即重复提交；若持续发生，请将参考号提供给管理员。';
+    }
+  }
   return Object.freeze({
-    ...(code === 'INTERNAL_UNKNOWN' || details.reason !== 'unknown' || details.httpStatus || details.providerCode || details.method ? { details } : {}),
+    ...(code === 'INTERNAL_UNKNOWN' || details.reason !== 'unknown' || details.httpStatus || details.providerCode || details.method || details.stage || details.submissionState ? { details } : {}),
     code,
     reason: safeReason ?? safeFailureReason(error?.code) ?? code,
     message: typeof userMessage === 'string' && userMessage.trim()
       ? userMessage.trim()
-      : t(FAILURE_MESSAGES[code]) + (code === 'SESSION_ARCHIVED' && error?.promptAccepted === true
+      : t(message) + (code === 'SESSION_ARCHIVED' && error?.promptAccepted === true
         ? `\n${t('本条消息可能仍在会话队列中，请先到 DSH 查看状态，避免重复提交。')}` : ''),
     referenceId: safeReferenceId(referenceId),
     at: Number.isFinite(at) ? at : Date.now(),
@@ -237,7 +261,7 @@ export function messageFailureText(failure) {
 export function messageFailureDiagnostic(error, failure) {
   const evidence = extractConnectionEvidence(error);
   return { code: failure.code, reason: failure.reason, referenceId: failure.referenceId,
-    details: evidence.details, errors: evidence.errors };
+    details: failure.details ?? evidence.details, errors: evidence.errors, ...evidence.correlation };
 }
 
 export function setLastMessageFailure(status, error, options) {
@@ -262,7 +286,7 @@ export function channelDeliveryFailure(error, { uncertain = true } = {}) {
         ? 'channel-delivery-uncertain'
         : 'channel-delivery-failed';
   if (Number.isInteger(status)) wrapped.status = status;
-  return wrapped;
+  return messageDiagnosticError(wrapped, { stage: 'message.send' });
 }
 
 export function publicMessageFailure(value) {

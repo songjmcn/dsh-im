@@ -1,3 +1,5 @@
+// Email conversation keys contain Message-IDs or bound Session IDs, not
+// recipient addresses. Keep email targets explicit until a mapping is stored.
 const CHANNELS = new Set([
   'weixin',
   'feishu',
@@ -9,6 +11,7 @@ const CHANNELS = new Set([
   'telegram',
   'discord',
   'whatsapp',
+  'imessage',
   'matrix',
 ]);
 
@@ -123,6 +126,15 @@ export function deliverySuggestionFromConversationKey(channel, key) {
       return discordSuggestion(key);
     case 'whatsapp':
       return whatsappSuggestion(key);
+    case 'imessage': {
+      const chatGuid = key.startsWith('direct:') ? key.slice('direct:'.length) : '';
+      // Older iMessage runtimes recorded every conversation as direct. Its
+      // native GUID's single-recipient marker must also match; + denotes groups.
+      return /^(?:iMessage|any);-;[^;]+$/u.test(chatGuid)
+        && chatGuid.length <= 512 && chatGuid.trim() === chatGuid
+        && !/[\u0000-\u001f\u007f]/u.test(chatGuid)
+        ? { kind: 'user', route: { chatGuid } } : null;
+    }
     case 'matrix':
       return matrixSuggestion(key.replace(/^(direct|group):/, ''));
     default:
@@ -146,6 +158,7 @@ export function privateDeliverySuggestionFromConversationKey(channel, key) {
     telegram: 'direct',
     discord: 'direct',
     whatsapp: 'direct',
+    imessage: 'direct',
     matrix: 'dm',
   }[channel];
   if (!privatePrefix || prefix !== privatePrefix) return null;

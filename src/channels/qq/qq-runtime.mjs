@@ -36,6 +36,7 @@ export class QqRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -56,6 +57,7 @@ export class QqRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -71,6 +73,7 @@ export class QqRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'qq', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -191,6 +194,7 @@ export class QqRuntime {
       harness: this.#harness,
       state: this.#state,
       contextEnhancement: this.#contextEnhancement,
+      groupHistory: this.#groupHistory,
       accessPolicy: this.#accessPolicy,
       status: this.#status,
       logger: this.#logger,

@@ -7,6 +7,8 @@
  */
 
 import { isMatrixEventId, isMatrixRoomId, isMatrixUserId } from './matrix-api.mjs';
+import { buildConversationRoute, encodeConversationRouteKey } from '../shared/conversation/route.mjs';
+import { evaluateTrigger } from '../shared/conversation/trigger-policy.mjs';
 
 const GRACE_MS = 5_000;
 const SKEW_OBSERVE_AFTER_MS = 30_000;
@@ -219,7 +221,8 @@ function eventOriginTs(event) {
   return Number.isSafeInteger(ts) && ts > 0 ? (ts < 1e12 ? ts * 1_000 : ts) : null;
 }
 
-function threadIdOf(content) {
+/** The thread root a timeline event belongs to, from its MSC3402 relations. */
+export function threadIdOf(content) {
   const relates = content?.['m.relates_to'];
   if (!relates || typeof relates !== 'object') return null;
   const chain = Array.isArray(relates.chain) ? relates.chain : [];
@@ -228,10 +231,37 @@ function threadIdOf(content) {
   return eventId && isMatrixEventId(eventId) ? eventId : null;
 }
 
-function replyEventIdOf(content) {
-  const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
-  const eventId = typeof inReplyTo?.event_id === 'string' ? inReplyTo.event_id : null;
+function cleanEventId(value) {
+  const eventId = typeof value === 'string' ? value.trim() : '';
   return eventId && isMatrixEventId(eventId) ? eventId : null;
+}
+
+/**
+ * The target of a genuine reply relation, in either relation form the Matrix
+ * spec permits: the new form names it under `m.relates_to` with
+ * `rel_type: "m.reply"`, the legacy form under the top-level `m.in_reply_to`,
+ * and this plugin's own writer nests it under `m.relates_to` for the events it
+ * sends itself. The `is_falling_back` marker — at `m.relates_to`, at the
+ * legacy `m.in_reply_to`, or on the nested form — demotes the declaration to
+ * the thread-membership statement clients attach automatically when sending
+ * inside a thread; per the spec that is not a human reply, so it must not
+ * drive reply context collection, reply classification, recorded reply targets,
+ * or the thread fork decision.
+ */
+export function replyEventIdOf(content) {
+  const relates = content?.['m.relates_to'];
+  const legacy = content?.['m.in_reply_to'];
+  const nested = relates?.['m.in_reply_to'];
+  if (relates?.is_falling_back === true || legacy?.is_falling_back === true || nested?.is_falling_back === true) return null;
+  if (relates?.rel_type === 'm.reply') {
+    const target = cleanEventId(relates.event_id);
+    if (target) return target;
+  }
+  for (const candidate of [legacy?.event_id, nested?.event_id]) {
+    const target = cleanEventId(candidate);
+    if (target) return target;
+  }
+  return null;
 }
 
 /**
@@ -281,10 +311,28 @@ export function normalizeMatrixTimelineEvent({
   const rawText = typeof content.body === 'string' ? content.body : '';
   const mentioned = detectMatrixMention(content, botUserId);
   const commandLike = isMatrixCommandLike(rawText);
-  const requiresMention = kind === 'group'
-    && config.requireMention !== false
-    && !(config.freeResponseRooms instanceof Set && config.freeResponseRooms.has(roomId));
-  if (requiresMention && !mentioned && !commandLike && replyToEventId === null) return { drop: 'mention-required' };
+  // One table decides the mention gate and the addressed bit, shared with other
+  // channels through the trigger policy. `triggerOnReply` defaults to 'never' —
+  // a room message wakes the bot only through an @-mention or a command, so an
+  // unaddressed reply on the room timeline or in a thread stays a recorded fact.
+  // 'any' restores the 4.25-era shape where every reply relation addresses the
+  // bot; 'bot-only' requires the channel's classifier (usually the bot-event
+  // binding table) to prove the reply answers one of the bot's own messages.
+  const replyTargetKind = kind === 'group' && replyToEventId !== null
+    && typeof deps.classifyReplyTarget === 'function'
+    ? deps.classifyReplyTarget(replyToEventId) ?? null
+    : null;
+  const gate = evaluateTrigger({
+    kind,
+    requireMention: config.requireMention,
+    freeResponse: config.freeResponseRooms instanceof Set && config.freeResponseRooms.has(roomId),
+    mentioned,
+    commandLike,
+    replyToPresent: replyToEventId !== null,
+    replyTargetKind,
+    replyMode: config.triggerOnReply,
+  });
+  if (!gate.pass) return { drop: gate.reason };
 
   const text = stripMatrixMentions(rawText, botUserId);
   const media = MEDIA_MSGTYPES.has(msgtype)
@@ -293,9 +341,42 @@ export function normalizeMatrixTimelineEvent({
   if (MEDIA_MSGTYPES.has(msgtype) && !media) return { drop: 'media-unusable' };
   if (msgtype !== 'm.text' && msgtype !== 'm.notice' && !MEDIA_MSGTYPES.has(msgtype)) return { drop: 'type' };
 
-  const conversationId = kind === 'direct'
-    ? `dm:${senderId.toLowerCase()}`
-    : `room:${roomId}${threadId ? `$${threadId}` : ''}`;
+  // Thread conversation fork policy. A genuine reply whose thread root equals
+  // its reply target says "answer this message" — the client started a thread at
+  // the replied-to event — so it inherits the conversation its target belongs to
+  // (the room's main conversation) instead of forking a fresh session. The
+  // thread-membership declaration clients attach automatically (a falling-back
+  // relation) is not a human reply and never selects a conversation: posts made
+  // inside a thread fork that thread's own conversation. A reply to a root the
+  // bot itself authored does the same — the panel under a bot answer is read as
+  // its own message list, not as a continuation of the mainline turn the answer
+  // once replied to. `isolate` restores fork-always; `auto` prefers the
+  // bot-event binding table when the channel supplies one for the reply target.
+  const threadsMode = config.threadsMode === 'isolate' || config.threadsMode === 'auto'
+    ? config.threadsMode
+    : 'inherit';
+  const rootIsBotAuthored = kind === 'group' && threadId !== null
+    && ((typeof deps.classifyReplyTarget === 'function' && deps.classifyReplyTarget(threadId) === 'bot')
+      || (typeof deps.isBotRoomEvent === 'function' && deps.isBotRoomEvent(roomId, threadId) === true));
+  const inheritsThreadTarget = kind === 'group' && threadId !== null
+    && threadsMode !== 'isolate' && replyToEventId === threadId && !rootIsBotAuthored;
+  const routeThreadId = kind === 'group' && threadId !== null && !inheritsThreadTarget ? threadId : null;
+  const boundRouteKey = threadsMode === 'auto' && kind === 'group' && replyToEventId !== null
+    && typeof deps.routeOverrideForReply === 'function'
+    ? deps.routeOverrideForReply(replyToEventId)
+    : null;
+  const routeKey = typeof boundRouteKey === 'string' && boundRouteKey
+    ? boundRouteKey
+    : encodeConversationRouteKey(buildConversationRoute({
+      channel: 'matrix',
+      botId: config.botId ?? null,
+      chatId: roomId,
+      senderId,
+      threadId: routeThreadId,
+      kind,
+    }));
+  const keyPrefix = kind === 'direct' ? 'direct:' : 'group:';
+  const conversationId = routeKey.startsWith(keyPrefix) ? routeKey.slice(keyPrefix.length) : routeKey;
 
   return {
     message: {
@@ -310,7 +391,7 @@ export function normalizeMatrixTimelineEvent({
       plainText: msgtype === 'm.text' && content.format !== 'org.matrix.custom.html',
       images: media?.images ?? [],
       files: media?.files ?? [],
-      addressed: kind === 'direct' || mentioned || commandLike || replyToEventId !== null,
+      addressed: gate.addressed,
       mentioned,
       threadId,
       replyToEventId,
@@ -352,6 +433,17 @@ export function normalizeMatrixDeliveryTarget({ kind, route } = {}) {
 
 export function matrixConversationKeyFromTarget(target) {
   if (!target) return null;
-  if (target.kind === 'dm') return `dm:${target.userId.toLowerCase()}`;
-  return `room:${target.roomId}${'threadId' in target && target.threadId ? `$${target.threadId}` : ''}`;
+  if (target.kind === 'dm') {
+    return encodeConversationRouteKey(buildConversationRoute({
+      channel: 'matrix',
+      chatId: target.userId,
+      senderId: target.userId,
+      kind: 'dm',
+    })).slice('direct:'.length);
+  }
+  return encodeConversationRouteKey(buildConversationRoute({
+    channel: 'matrix',
+    chatId: target.roomId,
+    threadId: 'threadId' in target ? target.threadId : null,
+  })).slice('group:'.length);
 }

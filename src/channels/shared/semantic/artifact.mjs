@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { copyFile, lstat, mkdtemp, open, realpath, unlink } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, open, realpath, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, extname, isAbsolute, join, resolve } from 'node:path';
 
@@ -35,12 +35,15 @@ const artifactProviderSettlements = new WeakMap();
 let managedSnapshotDirectoryPromise;
 
 function managedSnapshotDirectory() {
-  managedSnapshotDirectoryPromise ??= mkdtemp(join(tmpdir(), 'dsh-im-outbound-'));
+  managedSnapshotDirectoryPromise ??= mkdtemp(join(tmpdir(), 'dsh-im-outbound-')).catch((error) => {
+    managedSnapshotDirectoryPromise = undefined;
+    throw error;
+  });
   return managedSnapshotDirectoryPromise;
 }
 
-function artifactError(code, message) {
-  const error = new Error(message);
+function artifactError(code, message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
   error.code = code;
   return error;
 }
@@ -194,7 +197,17 @@ async function snapshotFile(workspace, requestedPath, signal) {
 
     const directory = await managedSnapshotDirectory();
     storagePath = join(directory, `${randomUUID()}.artifact`);
-    await copyFile(canonicalPath, storagePath, fsConstants.COPYFILE_EXCL);
+    try {
+      await copyFile(canonicalPath, storagePath, fsConstants.COPYFILE_EXCL);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      signal?.throwIfAborted();
+      // System temp cleanup can remove the cached directory between sends.
+      // Recreate it with mkdtemp's private permissions and retry only once.
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      signal?.throwIfAborted();
+      await copyFile(canonicalPath, storagePath, fsConstants.COPYFILE_EXCL);
+    }
     signal?.throwIfAborted();
 
     const snapshot = await lstat(storagePath, { bigint: true });
@@ -214,7 +227,7 @@ async function snapshotFile(workspace, requestedPath, signal) {
     if (storagePath) await unlink(storagePath).catch(() => undefined);
     if (error?.code?.startsWith?.('artifact-')) throw error;
     if (signal?.aborted) throw signal.reason ?? error;
-    throw artifactError('artifact-unavailable', 'The requested file is unavailable.');
+    throw artifactError('artifact-unavailable', 'The requested file is unavailable.', error);
   }
 }
 

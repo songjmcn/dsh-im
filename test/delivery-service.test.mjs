@@ -478,6 +478,31 @@ function approvalAdapter(channel, keys, { present = async () => true } = {}) {
   return { adapter, offers, notices };
 }
 
+for (const scenario of ['aliases', 'multiple-chats', 'unresolved', 'unsupported', 'failed']) {
+  test(`synced questions: ${scenario} routes to one private chat or sends a desktop notice`, async () => {
+    const service = createDeliveryService();
+    const keys = scenario === 'multiple-chats' ? ['p2p:a', 'p2p:b'] : ['p2p:a', 'p2p:a'];
+    const { adapter, notices } = approvalAdapter('feishu', keys);
+    const offered = [];
+    adapter.describeSessionSyncQuestionTarget = (_bot, id) => {
+      if (scenario === 'unresolved' && id === 'target1') throw new Error('binding unavailable');
+      return { conversationKey: keys[Number(id.slice(6))] };
+    };
+    if (scenario !== 'unsupported') adapter.presentSessionSyncQuestion = async (...args) => {
+      offered.push(args);
+      return scenario !== 'failed';
+    };
+    service.registerAdapter(adapter);
+    assert.equal(await service.presentSessionSyncQuestion('session', { kind: 'question' }), scenario === 'aliases');
+    assert.equal(offered.length, ['aliases', 'failed'].includes(scenario) ? 1 : 0);
+    if (scenario === 'aliases') assert.equal(notices.length, 0);
+    else {
+      assert.equal(notices.length, 2);
+      assert.match(notices[0][3], /桌面端回答/);
+    }
+  });
+}
+
 for (const channel of ['feishu', 'weixin', 'dingtalk', 'wecom', 'wecom-app', 'qq', 'telegram', 'slack', 'discord', 'whatsapp', 'matrix']) {
   test(`${channel}: one real bound private chat gets one approval despite target aliases`, async () => {
     const service = createDeliveryService();

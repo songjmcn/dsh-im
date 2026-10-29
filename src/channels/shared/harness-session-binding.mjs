@@ -83,7 +83,7 @@ function sessionSummary(sessionId, value) {
   return { cwd: summary.cwd, title: typeof title === 'string' ? title : null };
 }
 
-export async function adoptRegisteredWorkspaceSession(client, value, options = {}, timeoutMs = 30_000) {
+export async function adoptRegisteredWorkspaceSession(client, value, options = {}, timeoutMs = 30_000, method = 'session.create') {
   const sessionId = validatedSessionId(value);
   await client.ensureRunning(options);
   const workspaceList = await client.rpc('workspace.list', {}, timeoutMs, options);
@@ -103,12 +103,12 @@ export async function adoptRegisteredWorkspaceSession(client, value, options = {
   if (await client.isUngroupedWorkspace?.(workspace.path)) {
     await mkdir(workspace.path, { recursive: true });
   }
-  const adopted = await client.rpc('session.create', {
+  const adopted = await client.rpc(method, {
     ...(workspace.workspaceId ? { workspaceId: workspace.workspaceId } : { cwd: workspace.path }),
     sessionId,
   }, timeoutMs, options);
   if (!adopted || adopted.sessionId !== sessionId) {
-    throw new Error('Harness returned an invalid response for session.create');
+    throw new Error(`Harness returned an invalid response for ${method}`);
   }
   return {
     sessionId,

@@ -1,3 +1,4 @@
+import { isSessionNotFound } from './session-error.mjs';
 import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 
@@ -25,8 +26,8 @@ const SESSION_LIST_USAGE = [
   '不带工作区参数时，默认列出当前对话的有效工作区（未设置对话专属工作区时即 bot 默认工作区）。',
 ].join('\n');
 
-function commandResult(message, messages = [message]) {
-  return { handled: true, message, messages };
+function commandResult(message, messages = [message], extra = {}) {
+  return { handled: true, message, messages, ...extra };
 }
 
 function normalizedWorkspacePath(value) {
@@ -155,13 +156,18 @@ export function splitWorkspaceCommandMessage(message) {
   return messages;
 }
 
-async function runWorkspaceListCommand(match, harness) {
-  if (match[1]?.trim()) return commandResult(t('用法：/workspacelist'));
+/**
+ * The shared listing behind /ws, /workspace, /wsl, /workspaces and
+ * /workspacelist. Text stays byte-compatible with the pre-merge list so a
+ * channel without an interactive picker keeps exactly what it always showed;
+ * `listing` is the machine-readable half a channel may render as a picker.
+ */
+async function workspaceListingCommand(harness) {
   if (typeof harness?.listWorkspaces !== 'function') {
     return commandResult(t('当前机器人暂不支持列出工作区。'));
   }
   try {
-    const { current, paths } = await workspacePathSnapshot(harness);
+    const { current, paths, titles } = await workspacePathSnapshot(harness, { includeTitles: true });
     if (paths.length === 0) {
       return commandResult(t('当前 Harness Host 上没有仍然存在的已登记工作区。'));
     }
@@ -177,13 +183,20 @@ async function runWorkspaceListCommand(match, harness) {
       t('不带工作区参数时，/sessionlist 默认列出当前对话的有效工作区。'),
     ];
     const message = lines.join('\n');
-    return commandResult(message, splitWorkspaceCommandMessage(message));
+    return commandResult(message, splitWorkspaceCommandMessage(message), {
+      listing: { current: current ?? null, paths, titles: titles ?? {} },
+    });
   } catch (error) {
     if (error?.code === 'workspace-bot-not-found') {
       return commandResult(t('机器人正在移除或已重新接入，无法列出原会话的工作区。'));
     }
     return commandResult(t('暂时无法获取工作区列表，请稍后重试。'));
   }
+}
+
+async function runWorkspaceListCommand(match, harness) {
+  if (match[1]?.trim()) return commandResult(t('用法：/workspacelist'));
+  return workspaceListingCommand(harness);
 }
 
 async function conversationEffectiveWorkspace(harness, conversationKey) {
@@ -317,7 +330,7 @@ function sessionBindErrorMessage(error) {
     return t(`Session ID 格式无效。
 {usage}`, { usage: t(SESSION_BIND_USAGE) });
   }
-  if (['session-not-registered', 'session-not-found'].includes(error?.code)) {
+  if (error?.code === 'session-not-registered' || isSessionNotFound(error?.code)) {
     return t('未找到该会话，请先执行 /sessionlist 确认 Session ID。');
   }
   if (error?.code === 'session-subagent-unsupported') {
@@ -483,6 +496,24 @@ async function runConversationWorkspaceCommand(command, harness, conversationKey
   }
 }
 
+/**
+ * One failure mapping for every workspace-switch surface. The text command and
+ * the Telegram picker card call the same switch, so their receipts must not
+ * drift; returns null for errors this layer deliberately does not classify
+ * (the caller decides whether to rethrow or degrade).
+ */
+export function workspaceSwitchFailureText(error) {
+  if (['workspace-not-absolute', 'workspace-not-found', 'workspace-not-directory']
+    .includes(error?.code)) {
+    return t(`{message}
+用法：/workspace 工作区序号或绝对路径`, { message: error.message });
+  }
+  if (error?.code === 'workspace-bot-not-found') {
+    return t('机器人正在移除或已重新接入，无法切换原会话的工作区。');
+  }
+  return null;
+}
+
 export async function runWorkspaceCommand(text, harness, conversationKey) {
   if (!isWorkspaceCommand(text)) return null;
   const command = text.trim();
@@ -500,9 +531,9 @@ export async function runWorkspaceCommand(text, harness, conversationKey) {
   const match = WORKSPACE_COMMAND.exec(command);
   if (!match) return null;
   const workspace = match[1]?.trim();
-  if (!workspace) {
-    return commandResult(t('用法：/workspace 工作区序号或绝对路径'));
-  }
+  // Merged command: no argument opens the same listing as /wsl, so a channel
+  // with an inline keyboard can make the list itself the switcher.
+  if (!workspace) return workspaceListingCommand(harness);
   if (typeof harness?.switchWorkspace !== 'function') {
     return commandResult(t('当前机器人暂不支持切换工作区。'));
   }
@@ -522,13 +553,8 @@ export async function runWorkspaceCommand(text, harness, conversationKey) {
     const current = await harness.switchWorkspace(selected);
     return commandResult(t('工作区已切换为：{workspace}', { workspace: current }));
   } catch (error) {
-    if (['workspace-not-absolute', 'workspace-not-found', 'workspace-not-directory'].includes(error?.code)) {
-      return commandResult(t(`{message}
-用法：/workspace 工作区序号或绝对路径`, { message: error.message }));
-    }
-    if (error?.code === 'workspace-bot-not-found') {
-      return commandResult(t('机器人正在移除或已重新接入，无法切换原会话的工作区。'));
-    }
+    const failure = workspaceSwitchFailureText(error);
+    if (failure) return commandResult(failure);
     throw error;
   }
 }

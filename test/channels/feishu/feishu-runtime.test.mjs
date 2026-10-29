@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FeishuRuntime } from '../../../src/channels/feishu/feishu-runtime.mjs';
+import { FeishuHarnessBridge } from '../../../src/channels/feishu/bridge.mjs';
 import { rememberConnectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
 import { createSessionSyncCoordinator } from '../../../plugin-src/host/session-sync-coordinator.mjs';
 
@@ -462,6 +463,64 @@ test('FeishuRuntime stop waits for a pending Harness check and prevents startup 
   assert.equal(FakeWSClient.instances.length, 0);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(runtime.status, stopped);
+});
+
+test('FeishuRuntime bounds the bridge idle wait during stop', async t => {
+  const warnings = [];
+  const runtime = await startRuntimeForProbe({
+    slashCommands: false,
+    logger: { warn: (message) => warnings.push(message) },
+  });
+  const idle = deferred();
+  t.after(() => idle.resolve());
+  t.mock.method(FeishuHarnessBridge.prototype, 'waitForIdle', () => idle.promise);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  let stopped;
+  const stopping = runtime.stop().then((status) => { stopped = status; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.status.ready, false);
+  assert.equal(FakeWSClient.instances[0].state, 'closed');
+  assert.equal(stopped, undefined);
+
+  t.mock.timers.tick(1_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, undefined);
+  assert.deepEqual(warnings, []);
+
+  t.mock.timers.tick(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.notEqual(stopped, undefined, 'stop must finish after the 2000ms bridge idle deadline');
+  await stopping;
+  assert.equal(stopped.ready, false);
+  assert.equal(stopped.feishuLongConnectionState, 'idle');
+  assert.equal(stopped.slashCommandRegistration, 'idle');
+  assert.equal(stopped.error, null);
+  assert.equal(stopped.lastError, null);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /bridge idle wait timed out after 2000ms/);
+});
+
+test('FeishuRuntime unreferences and clears the idle deadline when the bridge is already idle', async t => {
+  const runtime = await startRuntimeForProbe({ slashCommands: false });
+  t.mock.method(FeishuHarnessBridge.prototype, 'waitForIdle', async () => {});
+  const setTimer = globalThis.setTimeout;
+  const clearTimer = globalThis.clearTimeout;
+  let timer;
+  t.after(() => clearTimer(timer));
+  const setTimeoutMock = t.mock.method(globalThis, 'setTimeout', (...args) => {
+    timer = setTimer(...args);
+    t.mock.method(timer, 'unref');
+    return timer;
+  });
+  const clearTimeoutMock = t.mock.method(globalThis, 'clearTimeout');
+
+  const stopped = await runtime.stop();
+  assert.equal(stopped.feishuLongConnectionState, 'idle');
+  assert.equal(setTimeoutMock.mock.callCount(), 1);
+  assert.equal(setTimeoutMock.mock.calls[0].arguments[1], 2_000);
+  assert.equal(timer.unref.mock.callCount(), 1);
+  assert.ok(clearTimeoutMock.mock.calls.some((call) => call.arguments[0] === timer));
 });
 
 test('FeishuRuntime fails closed when the initial WebSocket handshake times out', async () => {

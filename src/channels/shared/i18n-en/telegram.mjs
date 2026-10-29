@@ -8,6 +8,12 @@ export default {
   '开启一个全新会话': 'Start a brand-new Session',
   '压缩当前会话的较早上下文': 'Compact the earlier context of the current Session',
   '切换工作区': 'Switch Workspace',
+  // /ws workspace picker card: one tap switches, the pressed card is re-marked in place.
+  '选择要切换的工作区（共 {count} 个）：': 'Choose a Workspace to switch to ({count} total):',
+  '这个列表已过期，请重新发送 /ws。': 'This list has expired. Send /ws again.',
+  '正在切换工作区，请稍候。': 'Switching Workspaces, one moment.',
+  '已经在工作区：{workspace}': 'Already in this Workspace: {workspace}',
+  '暂时无法切换工作区，请稍后重试。': 'Could not switch Workspaces right now. Try again later.',
   '列出工作区绝对路径': 'List Workspace absolute paths',
   '列出会话 ID 和标题': 'List Session IDs and titles',
   '将当前聊天绑定到指定会话': 'Bind the current chat to a specific Session',

@@ -23,7 +23,7 @@ async function makeTempDirectory(prefix) {
 }
 
 after(async () => {
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function freshStore() {
@@ -95,6 +95,32 @@ test('the bot document round-trips through disk and rejects tampered or incomple
   deepStrictEqual(await store.remove(saved.botId), null, 'removing twice is a no-op');
 });
 
+test('the room-visible window and follow-up settings survive the save-and-reread round trip, off values included', async () => {
+  const { store, path } = await freshStore();
+  const settings = {
+    visibleContextEnabled: false,
+    visibleContextWindowMs: 90_000,
+    visibleContextLimit: 3,
+    visibleContextChars: 1_000,
+    coalesceWindowMs: 0,
+    autoSteerSameSender: false,
+    autoSteerLimit: 2,
+  };
+  await store.save(botFixture(settings));
+  for (const [key, value] of Object.entries(settings)) {
+    deepStrictEqual(store.list()[0][key], value, `${key} is kept through the store round trip`);
+  }
+  const reread = new MatrixConfigStore(path);
+  await reread.load();
+  deepStrictEqual(reread.list(), store.list(), 'the on-disk document carries the settings unchanged');
+  await rejects(() => store.save(botFixture({ ...settings, coalesceWindowMs: -1 })),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save(botFixture({ ...settings, visibleContextWindowMs: 'fast' })),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save(botFixture({ ...settings, autoSteerSameSender: 'yes' })),
+    /Refusing to persist incomplete Matrix bot data/u);
+});
+
 test('a corrupt-looking document fails closed on load and an absent file starts empty', async () => {
   const directory = await makeTempDirectory('dsh-im-matrix-store-');
   const path = join(directory, 'matrix-bots.json');
@@ -128,4 +154,63 @@ test('the sidecar persists the sync cursor, rooms, dm map and declines across re
   deepStrictEqual(JSON.parse(await readFile(path, 'utf8')).version, undefined,
     'the sidecar keeps a plain shape without the bot document envelope');
   await reread.remove();
+});
+
+test('thread and context-engine settings round-trip, defaults stay omitted, and invalid values fail closed', async () => {
+  const { store } = await freshStore();
+  await store.save(botFixture());
+  const untouched = store.list()[0];
+  deepStrictEqual(untouched.threadsMode, undefined, 'the default thread mode is not written out');
+  deepStrictEqual(untouched.triggerOnReply, undefined, 'the default reply trigger mode is not written out');
+  const enriched = botFixture({
+    threadsMode: 'isolate',
+    triggerOnReply: 'bot-only',
+    rootContextOnceEnabled: true,
+    replyContextEnabled: true,
+    ambientContextEnabled: true,
+    contextMaxChars: 12_000,
+    replyMaxDepth: 8,
+    ambientBurstGapMs: 60_000,
+    ambientRecentWindowMs: 300_000,
+    ambientRecentCount: 30,
+  });
+  await store.save(enriched);
+  const saved = store.list().find((bot) => bot.botId === enriched.botId);
+  deepStrictEqual({
+    threadsMode: saved.threadsMode,
+    triggerOnReply: saved.triggerOnReply,
+    rootContextOnceEnabled: saved.rootContextOnceEnabled,
+    replyContextEnabled: saved.replyContextEnabled,
+    ambientContextEnabled: saved.ambientContextEnabled,
+    contextMaxChars: saved.contextMaxChars,
+    replyMaxDepth: saved.replyMaxDepth,
+    ambientBurstGapMs: saved.ambientBurstGapMs,
+    ambientRecentWindowMs: saved.ambientRecentWindowMs,
+    ambientRecentCount: saved.ambientRecentCount,
+  }, {
+    threadsMode: 'isolate',
+    triggerOnReply: 'bot-only',
+    rootContextOnceEnabled: true,
+    replyContextEnabled: true,
+    ambientContextEnabled: true,
+    contextMaxChars: 12_000,
+    replyMaxDepth: 8,
+    ambientBurstGapMs: 60_000,
+    ambientRecentWindowMs: 300_000,
+    ambientRecentCount: 30,
+  });
+  const legacy = botFixture({ triggerOnReply: 'any' });
+  await store.save(legacy);
+  deepStrictEqual(store.list().find((bot) => bot.botId === legacy.botId).triggerOnReply, 'any',
+    'the 4.25-era reply shape round-trips as an explicit choice');
+  const explicitNever = botFixture({ triggerOnReply: 'never' });
+  await store.save(explicitNever);
+  deepStrictEqual(store.list().find((bot) => bot.botId === explicitNever.botId).triggerOnReply, undefined,
+    'the shipped default is not written out');
+  await rejects(() => store.save({ ...botFixture(), threadsMode: 'whatever' }),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save({ ...botFixture(), ambientRecentCount: 0 }),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save({ ...botFixture(), ambientContextEnabled: 'yes' }),
+    /Refusing to persist incomplete Matrix bot data/u);
 });

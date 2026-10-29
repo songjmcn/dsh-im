@@ -28,7 +28,7 @@ async function makeTempDirectory(prefix) {
 
 after(async () => {
   for (const engine of engines) await engine.stop();
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function eventually(assertion, timeoutMs = 4_000) {

@@ -48,7 +48,7 @@ export function wecomMenu({ workspace, workspaces = [] } = {}) {
     entries: [
       [t('切换工作区'), 'select:workspace'],
       [t('🆕 新会话'), '/new'],
-      [t('⏹ 停止'), '/stop'], [t('📐 压缩'), '/compact'], [t('🧹 清空上下文'), '/clear'],
+      [t('⏹ 停止'), '/stop'], [t('📐 压缩'), '/compact'],
       [t('📊 状态'), '/status'], [t('📖 帮助'), '/help'],
     ],
   };

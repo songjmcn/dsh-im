@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { FeishuHarnessBridge } from '../../../src/channels/feishu/bridge.mjs';
+import { StateStore } from '../../../src/channels/feishu/state-store.mjs';
 import { createSessionSyncCoordinator } from '../../../plugin-src/host/session-sync-coordinator.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -16,7 +20,7 @@ const end = (turn = 1, kind = 'completed') => ({ type: 'turn/end', seq: turn * 1
 async function fixture(t, { state, targets = [target], create, patch, history = [], sync = true, resolver, botId = 'bot-a', bridgeOptions = {} } = {}) {
   let listener;
   const controller = new AbortController();
-  const creates = [], patches = [], texts = [], warnings = [], visible = new Map(), mirrors = new Map();
+  const creates = [], patches = [], texts = [], warnings = [], historyCalls = [], visible = new Map(), mirrors = new Map();
   let savedHistory = history;
   state ??= {
     sessionFor: () => 'session', hasSeen: () => false, markSeen: async () => {},
@@ -29,8 +33,10 @@ async function fixture(t, { state, targets = [target], create, patch, history = 
       listener = onSessionEvent;
       return new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
     },
-    rpc: async (method) => {
+    rpc: async (method, params) => {
       assert.equal(method, 'session.history');
+      historyCalls.push(params);
+      if (typeof savedHistory === 'function') return savedHistory(params);
       return { events: savedHistory, hasMore: false };
     },
     ensureRunning: async () => true, sessionExists: async () => true,
@@ -51,7 +57,8 @@ async function fixture(t, { state, targets = [target], create, patch, history = 
       },
       patch: async request => {
         patches.push(structuredClone(request));
-        await patch?.(request);
+        const response = await patch?.(request);
+        if (response?.code) return response;
         visible.set(request.path.message_id, request.data.content);
         return { code: 0 };
       },
@@ -73,7 +80,7 @@ async function fixture(t, { state, targets = [target], create, patch, history = 
     await Promise.all([bridge.waitForIdle(), coordinator?.whenIdle()]);
     await flush();
   };
-  return { bridge, harness, state, mirrors, visible, creates, patches, texts, warnings, emit, drain, close,
+  return { bridge, harness, state, mirrors, visible, creates, patches, texts, warnings, historyCalls, emit, drain, close,
     raw: event => listener({ sessionId: 'session', event }),
     history: events => { savedHistory = events; }, coordinator,
   };
@@ -386,4 +393,252 @@ test('aborting runtime cancels mirror history timers', async t => {
   f.close();
   t.mock.timers.tick(120000); await flush();
   assert.equal(f.patches.length, before);
+});
+
+const MIRROR_TTL = 14 * 24 * 60 * 60_000;
+const expiredMessage = 'Message has expired when updating message, ext=Message can only be updated within fourteen days.';
+const completedHistory = [start(), user(), answer(), end()];
+
+async function savedMirror(t, changes = {}) {
+  const f = await fixture(t, { sync: false });
+  f.emit(start()); f.emit(user()); await f.drain();
+  f.close();
+  const [key, saved] = [...f.mirrors][0];
+  const entry = { ...saved, ...changes };
+  await f.state.setMirror(key, entry);
+  return { ...f, key, entry };
+}
+
+for (const age of [MIRROR_TTL, 27 * 24 * 60 * 60_000]) {
+  test(`orphan snapshot aged ${age} is cleared before history or provider requests`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+    const saved = await savedMirror(t, { claimedAt: Date.now() - age });
+    const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory });
+    await f.drain();
+    assert.deepEqual(saved.state.mirrorEntries(), []);
+    assert.equal(f.historyCalls.length, 0);
+    assert.equal(f.patches.length, 0);
+    t.mock.timers.tick(90_000); await f.drain();
+    assert.equal(f.patches.length, 0);
+    assert.equal(f.warnings.length, 1);
+  });
+}
+
+test('orphan just inside retention still recovers on its original card', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const saved = await savedMirror(t, { claimedAt: Date.now() - MIRROR_TTL + 1 });
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory });
+  await f.drain();
+  assert.equal(f.patches.length, 1);
+  assert.equal(f.patches[0].path.message_id, saved.entry.cardIds[0]);
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+});
+
+for (const legacy of [false, true]) {
+  for (const shape of ['sdk', 'message', 'business']) {
+    test(`expired ${legacy ? 'legacy' : 'block'} mirror stops after one ${shape} error`, async t => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const saved = await savedMirror(t, legacy ? { blocks: undefined } : {});
+      const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+        patch: async () => {
+          if (shape === 'business') return { code: 1, msg: expiredMessage };
+          if (shape === 'message') throw new Error(expiredMessage.toUpperCase());
+          throw Object.assign(new Error('Request failed with status code 400'), {
+            response: { status: 400, data: { msg: expiredMessage } },
+          });
+        },
+      });
+      await f.drain();
+      assert.deepEqual(saved.state.mirrorEntries(), []);
+      assert.equal(f.patches.length, 1);
+      t.mock.timers.tick(90_000); await f.drain();
+      assert.equal(f.patches.length, 1);
+      assert.ok(JSON.stringify(f.warnings).toLowerCase().includes('expired'));
+      f.close();
+      const restarted = await fixture(t, { sync: false, state: saved.state, history: completedHistory });
+      assert.equal(restarted.patches.length, 0);
+    });
+  }
+}
+
+for (const phase of ['running', 'finish']) {
+  test(`expired card at ${phase} keeps text fallback and retires the snapshot`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const f = await fixture(t, { patch: async request => {
+      if (phase === 'running' || request.data.content.includes('_已完成_')) {
+        throw Object.assign(new Error('HTTP 400'), { response: { data: { msg: expiredMessage } } });
+      }
+    } });
+    f.emit(start()); f.emit(user()); await f.drain();
+    f.emit(answer()); await f.drain();
+    f.emit(end()); await f.drain();
+    assert.equal(f.texts.filter(row => row[3] === '[DSH 助手]\n\ncomplete answer').length, 1);
+    assert.equal(f.mirrors.size, 0);
+    const count = f.patches.length;
+    t.mock.timers.tick(90_000); await f.drain();
+    assert.equal(f.patches.length, count);
+  });
+}
+
+test('recovery failure budget survives file reload and expires on the twentieth failure', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-recovery-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.json');
+  const state = await new StateStore(path).load();
+  await state.setMirror(saved.key, saved.entry);
+  const options = { sync: false, history: completedHistory, patch: async () => {
+    throw Object.assign(new Error('Request failed with status code 400'), {
+      response: { data: { msg: 'Unrelated temporary provider failure' } },
+    });
+  } };
+  const first = await fixture(t, { ...options, state });
+  await first.drain();
+  for (let i = 1; i < 18; i++) { t.mock.timers.tick(30_000); await first.drain(); }
+  assert.equal(first.patches.length, 18);
+  assert.equal(state.mirrorEntries()[0][1].recoveryFailures, 18);
+  assert.equal(state.mirrorEntries()[0][1].claimedAt, saved.entry.claimedAt);
+  assert.equal(state.mirrorEntries()[0][1].lastContent, saved.entry.lastContent);
+  first.close();
+  const reloaded = await new StateStore(path).load();
+  const second = await fixture(t, { ...options, state: reloaded });
+  await second.drain();
+  assert.equal(reloaded.mirrorEntries()[0][1].recoveryFailures, 19);
+  t.mock.timers.tick(30_000); await second.drain();
+  assert.equal(second.patches.length, 2);
+  assert.deepEqual(reloaded.mirrorEntries(), []);
+  t.mock.timers.tick(90_000); await second.drain();
+  assert.equal(second.patches.length, 2);
+  assert.deepEqual((await new StateStore(path).load()).mirrorEntries(), []);
+});
+
+test('each failed orphan retries only itself and deleted entries never reappear', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  const secondKey = saved.key.slice(0, -1) + '2';
+  await saved.state.setMirror(secondKey, { ...saved.entry, turn: 2, cardIds: ['card-two'] });
+  const f = await fixture(t, { sync: false, state: saved.state,
+    history: [...completedHistory, start(2), user(2), answer('second', 2), end(2)],
+    patch: async () => { throw new Error('offline'); },
+  });
+  await f.drain();
+  assert.equal(f.patches.length, 2);
+  t.mock.timers.tick(30_000); await f.drain();
+  assert.equal(f.patches.length, 4);
+  await saved.state.clearMirror(secondKey);
+  t.mock.timers.tick(30_000); await f.drain();
+  assert.equal(f.patches.length, 5);
+  assert.deepEqual(saved.state.mirrorEntries().map(([key]) => key), [saved.key]);
+});
+
+for (const claimedAt of [undefined, null, 'invalid', -1, 1_900_000_000_000]) {
+  test(`legacy timestamp ${claimedAt} receives one finite retention window`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+    const saved = await savedMirror(t, { claimedAt });
+    const f = await fixture(t, { sync: false, state: saved.state, history: [start(), user()] });
+    await f.drain();
+    const normalized = saved.state.mirrorEntries()[0][1].claimedAt;
+    assert.equal(normalized, Date.now());
+    t.mock.timers.tick(30_000); await f.drain();
+    assert.equal(saved.state.mirrorEntries()[0][1].claimedAt, normalized);
+    assert.equal(saved.state.mirrorEntries()[0][1].recoveryFailures, undefined);
+    assert.equal(f.patches.length, 0);
+    t.mock.timers.tick(MIRROR_TTL); await f.drain();
+    assert.deepEqual(saved.state.mirrorEntries(), []);
+    assert.equal(f.patches.length, 0);
+  });
+}
+
+test('history errors use the failure budget; incomplete history does not finish or reset it', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const saved = await savedMirror(t);
+  const f = await fixture(t, { sync: false, state: saved.state, history: () => { throw new Error('history offline'); } });
+  await f.drain();
+  assert.equal(saved.state.mirrorEntries()[0][1].recoveryFailures, 1);
+  // A history page that never reaches the requested turn is insufficient.
+  f.history(() => ({ events: [answer('unrelated', 2)], hasMore: true }));
+  t.mock.timers.tick(30_000); await f.drain();
+  assert.equal(saved.state.mirrorEntries()[0][1].recoveryFailures, 1);
+  assert.equal(f.patches.length, 0);
+  t.mock.timers.tick(MIRROR_TTL); await f.drain();
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+});
+
+test('an exhausted recovery record is cleared before making another request on restart', async t => {
+  const saved = await savedMirror(t, { recoveryFailures: 20 });
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory });
+  await f.drain();
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+  assert.equal(f.historyCalls.length, 0);
+  assert.equal(f.patches.length, 0);
+});
+
+test('successful orphan recovery cancels its timer and keeps the original message', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  let offline = true;
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+    patch: async () => { if (offline) throw new Error('offline'); },
+  });
+  await f.drain();
+  assert.equal(saved.state.mirrorEntries()[0][1].recoveryFailures, 1);
+  offline = false;
+  t.mock.timers.tick(30_000); await f.drain();
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+  assert.equal(f.creates.length, 0);
+  assert.ok(f.visible.get(saved.entry.cardIds[0]).includes('complete answer'));
+  const calls = f.historyCalls.length;
+  t.mock.timers.tick(90_000); await f.drain();
+  assert.equal(f.historyCalls.length, calls);
+});
+
+test('a pending orphan patch cancelled by runtime stop neither increments nor retries', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  t.after(release);
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory, patch: () => pending });
+  assert.equal(f.patches.length, 1);
+  f.close(); await f.drain();
+  assert.deepEqual(saved.state.mirrorEntries(), [[saved.key, saved.entry]]);
+  release(); await flush();
+  t.mock.timers.tick(90_000); await f.drain();
+  assert.equal(f.patches.length, 1);
+  assert.deepEqual(saved.state.mirrorEntries(), [[saved.key, saved.entry]]);
+});
+
+test('a queued orphan timer rereads state after another session task deletes its entry', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t);
+  const secondKey = saved.key.slice(0, -1) + '2';
+  await saved.state.setMirror(secondKey, { ...saved.entry, turn: 2, cardIds: ['card-two'] });
+  const history = [...completedHistory, start(2), user(2), answer('second', 2), end(2)];
+  const f = await fixture(t, { sync: false, state: saved.state, history,
+    patch: async () => { throw new Error('offline'); },
+  });
+  await f.drain();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  t.after(() => release({ events: history, hasMore: false }));
+  f.history(() => pending);
+  t.mock.timers.tick(30_000); await flush();
+  await saved.state.clearMirror(secondKey);
+  release({ events: history, hasMore: false }); await f.drain();
+  assert.equal(f.patches.length, 3, 'only the first timer may patch after the queued second entry was deleted');
+  assert.deepEqual(saved.state.mirrorEntries().map(([key]) => key), [saved.key]);
+});
+
+test('overflow recovery stops at the first expired chunk', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const saved = await savedMirror(t, { cardIds: ['old-first', 'old-second'] });
+  const f = await fixture(t, { sync: false, state: saved.state, history: completedHistory,
+    patch: async () => { throw new Error(expiredMessage); },
+  });
+  await f.drain();
+  assert.deepEqual(f.patches.map(request => request.path.message_id), ['old-first']);
+  assert.deepEqual(saved.state.mirrorEntries(), []);
+  t.mock.timers.tick(60_000); await f.drain();
+  assert.equal(f.patches.length, 1);
 });

@@ -992,11 +992,14 @@ test('Weixin explains model image rejection and records only safe structured dia
     code: 'INPUT_INVALID',
     reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES',
     message: '当前模型不支持图片，请用 /models 查看可用模型，再用 /model <序号> 切换后重发。',
+    details: status.lastMessageError.details,
     referenceId: status.lastMessageError.referenceId,
     at: status.lastMessageError.at,
   });
   assert.match(status.lastMessageError.referenceId, /^MF-[A-F0-9]{8}$/);
   assert.equal(Number.isFinite(status.lastMessageError.at), true);
+  assert.equal(status.lastMessageError.details.stage, 'operation');
+  assert.equal(status.lastMessageError.details.submissionState, 'unknown');
   assert.doesNotMatch(JSON.stringify(status.lastMessageError), /private|provider-token|providerDetail/);
 });
 
@@ -2308,18 +2311,20 @@ test('bridge commands are local and internal failures return a safe traceable me
   await bridge.accept(message('new', '/new'));
   assert.equal(fixture.sessions.has('p2p:owner-user'), false);
   await bridge.accept(message('failure', '触发失败'));
-  assert.match(sent.at(-1), /任务未完成，暂时无法确定原因/);
+  assert.match(sent.at(-1), /消息在提交前处理失败，尚未提交执行/);
   assert.match(sent.at(-1), /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(sent.at(-1), /private path|secret|token-shaped/);
   assert.deepEqual(status.lastMessageError, {
-    details: { reason: 'unknown' },
+    details: status.lastMessageError.details,
     code: 'INTERNAL_UNKNOWN',
     reason: 'INTERNAL_UNKNOWN',
-    message: '任务未完成，暂时无法确定原因。请重试；若持续发生，请将参考号提供给管理员。',
+    message: '消息在提交前处理失败，尚未提交执行。请重试；若持续发生，请将参考号提供给管理员。',
     referenceId: status.lastMessageError.referenceId,
     at: status.lastMessageError.at,
   });
   assert.match(status.lastMessageError.referenceId, /^MF-[A-F0-9]{8}$/);
+  assert.equal(status.lastMessageError.details.stage, 'session.prepare');
+  assert.equal(status.lastMessageError.details.submissionState, 'not-submitted');
   assert.doesNotMatch(JSON.stringify(status.lastMessageError), /private path|secret|token-shaped/);
 });
 

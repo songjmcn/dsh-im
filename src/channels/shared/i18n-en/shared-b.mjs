@@ -3,8 +3,8 @@ export default {
   // workspace-command.mjs
   '用法：/session Session ID 或当前工作区序号（/session N）':
     'Usage: /session Session ID or the session index in the current Workspace (/session N)',
-  '用法：\n/sessionlist  列出当前工作区会话\n/sessionlist --limit N  列出当前工作区前 N 个会话（N 为正整数）\n/sessionlist 工作区序号  按 /workspacelist 序号列出会话\n/sessionlist 工作区绝对路径  列出指定工作区会话':
-    'Usage:\n/sessionlist  List Sessions in the current Workspace\n/sessionlist --limit N  List the first N Sessions in the current Workspace (N must be a positive integer)\n/sessionlist Workspace index  List Sessions by /workspacelist index\n/sessionlist Workspace absolute path  List Sessions in the given Workspace',
+  '用法：\n/sessionlist  列出当前工作区会话\n/sessionlist --limit N  列出当前工作区前 N 个会话（N 为正整数）\n/sessionlist 工作区序号  按 /workspacelist 序号列出会话\n/sessionlist 工作区绝对路径  列出指定工作区会话\n不带工作区参数时，默认列出当前对话的有效工作区（未设置对话专属工作区时即 bot 默认工作区）。':
+    'Usage:\n/sessionlist  List Sessions in the current Workspace\n/sessionlist --limit N  List the first N Sessions in the current Workspace (N must be a positive integer)\n/sessionlist Workspace index  List Sessions by /workspacelist index\n/sessionlist Workspace absolute path  List Sessions in the given Workspace\nWithout a workspace argument it lists the workspace this conversation effectively uses (the bot default when no conversation workspace is set).',
   '工作区必须是绝对路径。\n{usage}': 'The Workspace must be an absolute path.\n{usage}',
   '工作区路径包含不支持的字符或长度超过限制。\n{usage}':
     'The Workspace path contains unsupported characters or exceeds the length limit.\n{usage}',
@@ -83,6 +83,11 @@ export default {
   '否': 'No',
   '用法：/workspace 工作区序号或绝对路径':
     'Usage: /workspace Workspace index or absolute path',
+  '查看或切换工作区': 'View or switch Workspace',
+  '/workspace 或 /ws  查看可切换的工作区（点按钮切换）':
+    '/workspace or /ws  View switchable Workspaces (tap a button to switch)',
+  '/workspacelist、/wsl、/workspaces  工作区列表别名（等同 /ws）':
+    '/workspacelist, /wsl, /workspaces  Workspace-list aliases (same as /ws)',
   '当前机器人暂不支持切换工作区。': 'This bot does not support switching Workspaces yet.',
   '工作区已切换为：{workspace}': 'Workspace switched to: {workspace}',
   '{message}\n用法：/workspace 工作区序号或绝对路径':
@@ -285,6 +290,8 @@ export default {
   '任务已结束，没有正在运行的任务，无法补充指令。请直接发送消息开始新任务。':
     'The task has ended and there is no running task to steer. Send a message to start a new task.',
   '已排队，等待前序消息处理。': 'Queued. Waiting for the preceding messages to finish.',
+  '排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。':
+    'A queued message was interrupted when the service restarted. It was not replayed automatically to avoid running it twice; if it was not processed, please send it again.',
   '已提交补充指令，Agent 会在下一步读取。':
     'Additional instruction submitted; the Agent will read it at the next step.',
 };

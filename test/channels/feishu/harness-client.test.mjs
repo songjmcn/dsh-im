@@ -8,6 +8,7 @@ import {
   HarnessReplyTracker,
 } from '../../../src/channels/feishu/harness-client.mjs';
 import { imSourceGuidance } from '../../../src/channels/shared/im-source-guidance.mjs';
+import { extractConnectionEvidence } from '../../../src/channels/shared/connection-error.mjs';
 import {
   OUTBOUND_ARTIFACT_TOOL,
   createOutboundArtifactTool,
@@ -792,7 +793,11 @@ test('HarnessClient cleans staged inbound files when session.prompt rejects them
     client.ask('session-rejected-file', '', {
       files: [{ name: 'rejected.dat', data: Buffer.from('bytes') }],
     }),
-    (error) => error === promptFailure,
+    (error) => {
+      assert.deepEqual(error, promptFailure);
+      assert.equal(extractConnectionEvidence(error).details.submissionState, 'unknown');
+      return true;
+    },
   );
   assert.equal(cleanupCalls, 1);
 });
@@ -829,7 +834,11 @@ test('HarnessClient retains staged files when an accepted turn outcome is unknow
       files: [{ name: 'uncertain.dat', data: Buffer.from('bytes') }],
       timeoutMs: 1_000,
     }),
-    (error) => error === uncertainFailure,
+    (error) => {
+      assert.deepEqual(error, uncertainFailure);
+      assert.equal(extractConnectionEvidence(error).details.submissionState, 'accepted');
+      return true;
+    },
   );
   assert.equal(cleanupCalls, 0, 'uncertain accepted turns may still be reading the staged path');
 });
@@ -901,7 +910,11 @@ for (const failHandoff of [false, true]) {
       },
     });
     if (failHandoff) {
-      await assert.rejects(asking, (error) => error === handoffError);
+      await assert.rejects(asking, (error) => {
+        assert.deepEqual(error, handoffError);
+        assert.equal(extractConnectionEvidence(error).details.submissionState, 'accepted');
+        return true;
+      });
       assert.deepEqual(delivered, []);
       assert.deepEqual(outboundArtifactRegistry.take('session-file-only', 2), []);
       return;

@@ -1105,7 +1105,15 @@ test('/workspace command supports fresh list numbers, preserves paths, and retur
   };
 
   assert.equal(await runWorkspaceCommand('hello', harness), null);
-  assert.match((await runWorkspaceCommand('/workspace', harness)).message, /用法/);
+  // Merged command: a bare /workspace lists the switchable workspaces instead of
+  // pointing at /wsl; the text list itself stays exactly what /wsl always sent.
+  const bare = await runWorkspaceCommand('/workspace', harness);
+  assert.match(bare.message, /当前 Harness Host 上存在的工作区（/);
+  assert.deepEqual(bare.listing, {
+    current: defaultWorkspace,
+    paths: [defaultWorkspace, alternateWorkspace],
+    titles: {},
+  });
   assert.match(
     (await runWorkspaceCommand(`/workspace ${alternateWorkspace}`, harness)).message,
     new RegExp(alternateWorkspace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),

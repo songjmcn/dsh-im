@@ -63,6 +63,29 @@ test('history lag recovers without another event and does not consume send attem
   assert.equal(f.sent[0].outcome.text, 'result');
 });
 
+test('an old timeout without user/message recovers its exact early model failure', async (t) => {
+  const history = [
+    event('agent/inbox/spliced', 1, { target: 'next-turn', start: 0,
+      inserted: [{ source: { rpcId: 'im-prompt' } }] }),
+    event('turn/start', 2, { turn: 3 }),
+    event('agent/inbox/spliced', 3, { target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+    event('turn/end', 4, { turn: 3, reason: { kind: 'error', error: { code: 'UNKNOWN_MODEL' } } }),
+    event('turn/start', 5, { turn: 4 }),
+    event('user/message', 6, { source: { rpcId: 'other-caller' } }),
+    event('assistant/message', 7, { ...answer.data, turn: 4 }),
+    event('turn/end', 8, { turn: 4, reason: 'completed' }),
+  ];
+  const f = await fixture(t, { harness: { rpc: async () => ({ events: history, hasMore: false }) } });
+  await f.track(timeout({ turn: null }));
+  await f.coordinator.whenIdle();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].outcome.turn, 3);
+  assert.equal(f.sent[0].outcome.reason, 'error');
+  assert.equal(f.sent[0].outcome.found, false);
+  assert.equal(f.sent[0].outcome.text, null);
+  assert.deepEqual(f.state.deferredEntries(), []);
+});
+
 test('definite send failures retry automatically, stop after three attempts, and retain the row for diagnosis', async (t) => {
   let sends = 0;
   const f = await fixture(t, { deliver: async () => { sends++; throw Object.assign(new Error('rate limited'), { status: 429 }); } });

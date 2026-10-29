@@ -5,6 +5,7 @@ import { normalizeBotAlias } from '../../../../src/channels/shared/bot-alias.mjs
 import { SET_ALIAS_ENDPOINT, validAliasPayload } from '../shared/bot-alias-rpc.mjs';
 import { registerManagementRpc } from '../../../management-rpc.mjs';
 import QRCode from 'qrcode';
+import { qrEncodingError } from '../../../../src/channels/shared/qr-encoding-error.mjs';
 import {
   normalizeAgentPresetCatalog,
   normalizeAgentPresetId,
@@ -105,6 +106,7 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   credential_update_failed: 'Unable to store the repaired Feishu credentials.',
   credential_state_unknown: 'The repaired Feishu credentials could not be confirmed after saving.',
   repair_connection_failed: 'The callback update was accepted, but the selected bot could not reconnect.',
+  repair_permissions_save_failed: 'Feishu granted the permissions, but their local state could not be saved. Please retry.',
   group_message_permission_required: 'Authorize access to all group messages before enabling this mode.',
   group_message_permission_save_failed: 'Feishu granted the permission, but all-message mode could not be saved.',
   group_message_permission_connection_failed: 'Feishu granted the permission, but the selected bot could not reconnect.',
@@ -411,9 +413,9 @@ function validPayload(endpoint, payload) {
       : 'Callback repair requires a single valid botId.';
   }
   if (endpoint === FEISHU_ENDPOINTS.beginGroupMessagePermission) {
-    return hasOnlyKeys(payload, new Set(['botId'])) && safeOpaqueId(payload.botId)
-      ? null
-      : 'Group message permission update requires a single valid botId.';
+    return hasOnlyKeys(payload, new Set(['botId', 'preserveResponseMode'])) && safeOpaqueId(payload.botId)
+      && (payload.preserveResponseMode === undefined || typeof payload.preserveResponseMode === 'boolean')
+      ? null : 'Group message permission update requires a valid botId and optional preserveResponseMode.';
   }
   if (endpoint === FEISHU_ENDPOINTS.bindCredentials) {
     return hasOnlyKeys(payload, new Set(['appId', 'appSecret', 'domain']))
@@ -612,7 +614,10 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
     let encoded = qrCache.get(url);
     if (!encoded) {
       if (qrCache.size >= 32) qrCache.delete(qrCache.keys().next().value);
-      encoded = Promise.resolve().then(() => encodeQr(url));
+      encoded = Promise.resolve().then(() => encodeQr(url)).catch(error => {
+        if (qrCache.get(url) === encoded) qrCache.delete(url);
+        throw qrEncodingError(error);
+      });
       qrCache.set(url, encoded);
     }
     return encoded;
@@ -656,7 +661,7 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
         if (typeof controller.startGroupMessagePermission !== 'function') {
           throw new Error('Feishu group message permission update is unavailable.');
         }
-        const started = await controller.startGroupMessagePermission(payload.botId);
+        const started = await controller.startGroupMessagePermission(payload.botId, { preserveResponseMode: payload.preserveResponseMode === true });
         const attemptId = String(publicRegistration(started?.registration).attempt);
         const ready = await waitForQr(controller, started, attemptId, signal);
         value = (await toPublicFeishuStatus(ready, { encodeQr: cachedEncodeQr })).provisioning;

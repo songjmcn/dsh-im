@@ -67,7 +67,7 @@ test('task buttons return their result without appending menu cards or invoking 
       await f.bridge.accept(f.frame('/m'));
       const card = f.latest();
       assert.equal(f.sent[0].card.select_list.length, 3);
-      assert.equal(card.button_list.length, 7);
+      assert.equal(card.button_list.length, 6, 'WeCom supports at most six buttons per card');
       await f.click(label);
       const replies = f.sent.slice(2);
       assert.ok(replies.some((entry) => result.test(entry.content ?? '')));

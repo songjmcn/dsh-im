@@ -84,10 +84,11 @@ test('default registration adds missing commands to an old panel and preserves e
   const first = await registerSlashCommands(options);
   assert.deepEqual(first.failed, []);
   assert.equal(first.created.length, 20);
-  assert.equal(SLASH_COMMAND_MANIFEST.length, 34);
+  assert.equal(SLASH_COMMAND_MANIFEST.length, 31);
   assert.equal(remoteItems.size, 35);
-  assert.deepEqual(SLASH_COMMAND_MANIFEST.slice(0, originalCommands.length + 1).map((entry) => entry.command), [
-    ...originalCommands.slice(0, 5), 'clear', ...originalCommands.slice(5),
+  assert.deepEqual(SLASH_COMMAND_MANIFEST.slice(0, 12).map((entry) => entry.command), [
+    'menu', 'new', 'help', 'status', 'compact', 'clear', 'sessionlist', 'ws',
+    'watch', 'unwatch', 'watchlist', 'archived',
   ]);
   for (const { command } of SLASH_COMMAND_MANIFEST) assert.ok(remoteItems.has(command));
   for (const entry of initialItems) assert.deepEqual(remoteItems.get(entry.command), entry);

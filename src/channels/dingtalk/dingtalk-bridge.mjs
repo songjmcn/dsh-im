@@ -1399,6 +1399,7 @@ export class DingtalkHarnessBridge {
         if (cardStarted) cardStartedAt = startedAt;
       }
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(sessionWebhook, notice, this.#atUsersFor(message)),
         deferredDelivery: () => ({ coordinator: this.#deferred, target: { ...cardTarget(message, sender), robotCode: this.#clientId } }),
         harness: this.#harness,
         state: this.#state,

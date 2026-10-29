@@ -21,6 +21,7 @@ const ILINK_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const WEIXIN_CDN_UPLOAD_RETRIES = 3;
+const WEIXIN_TEXT_SEND_RETRY_DELAYS_MS = [400, 1_200];
 const WEIXIN_CDN_UPLOAD_IDLE_TIMEOUT_MS = 60_000;
 const WEIXIN_CDN_UPLOAD_CHUNK_BYTES = 64 * 1024;
 const WEIXIN_MESSAGE_ID_TIMESTAMP_SHIFT = 22n;
@@ -497,6 +498,24 @@ async function requestJson(fetchImpl, {
   }
 }
 
+// A text reply is the only thing the user gets, so a single connection-level failure must not
+// discard it. Only `network-error` is repeated: it means no HTTP response arrived at all, while
+// `timeout`, `http-error` and `send-rejected` may already have been delivered. iLink does not
+// deduplicate by `client_id`, so the caller keeps one id for every attempt of the same chunk and
+// accepts that a request which reached the service just before the socket died can still arrive twice.
+async function requestTextSend(fetchImpl, createRequest, { signal }) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await requestJson(fetchImpl, createRequest());
+    } catch (error) {
+      const retryDelayMs = WEIXIN_TEXT_SEND_RETRY_DELAYS_MS[attempt];
+      if (retryDelayMs === undefined || error?.code !== 'network-error' || signal?.aborted) throw error;
+      await new Promise((resolve) => { setTimeout(resolve, retryDelayMs); });
+      signal?.throwIfAborted?.();
+    }
+  }
+}
+
 function validateLoginResponse(value) {
   if (!value || typeof value !== 'object' || !LOGIN_STATUSES.has(value.status)) {
     throw new WeixinApiError('invalid-login-status', '微信服务返回了无法识别的扫码状态。');
@@ -741,7 +760,7 @@ export function createWeixinApi({ fetchImpl = fetch, uploadFetchImpl = fetchImpl
       const content = nonEmptyString(text);
       if (!recipient || !content) throw new TypeError('toUserId and text are required');
       const clientId = `dsh-weixin-${randomUUID()}`;
-      const response = await requestJson(fetchImpl, {
+      const response = await requestTextSend(fetchImpl, () => ({
         method: 'POST',
         baseUrl,
         endpoint: 'ilink/bot/sendmessage',
@@ -760,7 +779,7 @@ export function createWeixinApi({ fetchImpl = fetch, uploadFetchImpl = fetchImpl
           },
           base_info: baseInfo(),
         },
-      });
+      }), { signal });
       const sendRejection = rejectedProviderResponse(response);
       if (sendRejection) {
         throw new WeixinApiError(

@@ -7,6 +7,7 @@ export const REQUIRED_TENANT_SCOPES = Object.freeze([
   'im:message.p2p_msg:readonly',
   'im:message.group_at_msg:readonly',
   'im:message.group_at_msg.include_bot:readonly',
+  'im:message.group_msg',
   'im:message:readonly',
   'im:message:send_as_bot',
   'im:message.reactions:write_only',
@@ -208,6 +209,7 @@ export class DshFeishuController {
         botName: bot.name,
         botOpenId: bot.openId,
         activated: bot.activated,
+        groupMessagePermissionGranted: true,
         connectedAt: new Date().toISOString(),
       });
     } catch (error) {

@@ -7,10 +7,56 @@ import { dirname } from 'node:path';
  * explicit: a subclass reads and writes them through extensionState().
  */
 const EXTENSION_KEYS = Object.freeze([
-  'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds',
+  'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds', 'rootAnchors',
+  'whatsappBotMessageIds',
 ]);
 
+const PENDING_MESSAGE_LIMIT = 200;
+
 const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [], cursor: null });
+
+/**
+ * A message persisted when it enters a bridge's in-memory queue, so a restart
+ * before its turn runs can replay it (submitted: false) or report it
+ * (submitted: true, meaning the Harness inbox already owns it).
+ *
+ * Wired today by TextHarnessBridge (telegram, slack, discord, matrix,
+ * whatsapp, email, imessage) and QqHarnessBridge. The channels that run their
+ * own queue path (weixin, dingtalk, wecom, wecom-app, feishu) still need the
+ * same treatment.
+ */
+function validPendingMessage(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+    && ['id', 'key', 'messageId', 'kind', 'text']
+      .every((field) => typeof value[field] === 'string' && value[field]);
+}
+
+function normalizePendingMessage(value) {
+  if (!validPendingMessage(value)) return null;
+  const entry = {
+    id: value.id,
+    key: value.key,
+    messageId: value.messageId,
+    kind: value.kind,
+    text: value.text,
+    submitted: value.submitted === true,
+  };
+  if (typeof value.senderId === 'string' && value.senderId) entry.senderId = value.senderId;
+  if (typeof value.createdAt === 'string' && value.createdAt) entry.createdAt = value.createdAt;
+  if (value.target !== undefined) {
+    try {
+      entry.target = structuredClone(value.target);
+    } catch {
+      // A target that cannot be persisted is dropped; the entry still replays.
+    }
+  }
+  return entry;
+}
+
+function normalizePendingMessages(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map(normalizePendingMessage).filter(Boolean).slice(-PENDING_MESSAGE_LIMIT);
+}
 
 function normalizeState(value) {
   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
@@ -22,9 +68,13 @@ function normalizeState(value) {
       }
     }
   }
+  // An empty queue leaves no key behind, so an untouched state file keeps the
+  // shape earlier versions wrote.
+  const pendingMessages = normalizePendingMessages(value.pendingMessages);
   const normalized = {
     version: 1,
     sessions,
+    ...(pendingMessages.length ? { pendingMessages } : {}),
     ...(value.deferred ? { deferred: normalizeDeferredState(value.deferred) } : {}),
     seenMessageIds: Array.isArray(value.seenMessageIds)
       ? value.seenMessageIds.filter((id) => typeof id === 'string' && id).slice(-1_000)
@@ -64,6 +114,51 @@ export class ConversationStateStore {
   putDeferred(entry) { return this.#deferred.put(entry); }
   patchDeferred(id, patch) { return this.#deferred.patch(id, patch); }
   removeDeferred(id) { return this.#deferred.remove(id); }
+
+  pendingMessages() {
+    return structuredClone(this.#state.pendingMessages ?? []);
+  }
+
+  async putPendingMessage(entry) {
+    const normalized = normalizePendingMessage({
+      createdAt: new Date().toISOString(),
+      ...entry,
+    });
+    if (!normalized) throw new TypeError('Invalid pending message entry');
+    const list = this.#state.pendingMessages ??= [];
+    const index = list.findIndex((candidate) => candidate.id === normalized.id);
+    if (index < 0) list.push(normalized);
+    else list[index] = normalized;
+    if (list.length > PENDING_MESSAGE_LIMIT) {
+      list.splice(0, list.length - PENDING_MESSAGE_LIMIT);
+    }
+    await this.#persist();
+  }
+
+  async patchPendingMessage(id, patch) {
+    const current = (this.#state.pendingMessages ?? []).find((entry) => entry.id === id);
+    if (!current) return null;
+    const next = {
+      ...current,
+      ...patch,
+      id: current.id,
+      key: current.key,
+      messageId: current.messageId,
+      kind: current.kind,
+      text: current.text,
+    };
+    await this.putPendingMessage(next);
+    return normalizePendingMessage(next);
+  }
+
+  async removePendingMessage(id) {
+    const list = this.#state.pendingMessages ?? [];
+    const next = list.filter((entry) => entry.id !== id);
+    if (next.length === list.length) return;
+    if (next.length) this.#state.pendingMessages = next;
+    else delete this.#state.pendingMessages;
+    await this.#persist();
+  }
 
   sessionFor(key) {
     return this.#state.sessions[key] ?? null;

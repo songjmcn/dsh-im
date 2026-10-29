@@ -151,8 +151,9 @@ if (client.includes('settings.plugins.tab') || clientSources.includes('settings.
 // email settings, the Telegram thinking-traces block, and Feishu panel settings.
 // The context editor contains one switch template and one mapped field-input
 // template; the delivery target adds one ordinary checkbox template; the
-// Telegram thinking-traces block adds one ordinary checkbox template. General
-// settings adds one mapped switch template for the two Feishu panel preferences.
+// Telegram thinking-traces block adds two ordinary checkbox templates (traces
+// and frame numbering). General settings adds one mapped switch template for
+// the two Feishu panel preferences.
 const contextEditorSource = await readFile(resolve(root, 'plugin-src/client/context-enhancement.js'), 'utf8');
 const deliverySettingsSource = await readFile(resolve(root, 'plugin-src/client/delivery-settings.js'), 'utf8');
 const emailSettingsSource = await readFile(resolve(root, 'plugin-src/client/channels/email/index.js'), 'utf8');
@@ -167,12 +168,12 @@ const otherClientSources = clientSources
 if (/role:\s*["']switch|type:\s*["']checkbox/.test(otherClientSources)
   || (deliverySettingsSource.match(/type:\s*["']checkbox["']/g) ?? []).length !== 1
   || /role:\s*["']switch["']/u.test(deliverySettingsSource)
-  || (thinkingTracesSource.match(/type:\s*["']checkbox["']/g) ?? []).length !== 1
+  || (thinkingTracesSource.match(/type:\s*["']checkbox["']/g) ?? []).length !== 2
   || /role:\s*["']switch["']/u.test(thinkingTracesSource)
   || (botGeneralSettingsSource.match(/type:\s*["']checkbox["']/g) ?? []).length !== 1
   || (botGeneralSettingsSource.match(/role:\s*["']switch["']/g) ?? []).length !== 1
   || (client.match(/role:\s*["']switch["']/g) ?? []).length !== 2
-  || (client.match(/type:\s*["']checkbox["']/g) ?? []).length !== 5) {
+  || (client.match(/type:\s*["']checkbox["']/g) ?? []).length !== 6) {
   throw new Error('checkable inputs must be limited to context enhancement, Session sync, email settings, Telegram thinking traces, and Feishu panel settings');
 }
 for (const marker of ['bot.context-enhancement.set', '<dsh_im_source>', '<dsh_im_source_guidance>']) {
@@ -224,7 +225,7 @@ const directDependencies = {
   '@tencent-connect/qqbot-nodejs': '1.0.4',
   '@wecom/aibot-node-sdk': '1.0.7',
   qrcode: '1.5.4',
-  undici: '7.29.1',
+  undici: '7.30.1',
 };
 for (const [name, version] of Object.entries(directDependencies)) {
   if (manifest.dependencies?.[name] !== version) {
@@ -262,6 +263,17 @@ if (process.platform !== 'win32' && (executable.mode & 0o111) === 0) {
 if (/private-bot-token|must-be-rolled-back|DEEPSEEK_API_KEY=/.test(client + host)) {
   throw new Error('built artifacts contain a test or environment secret marker');
 }
-await import(pathToFileURL(resolve(root, 'lib/index.js')).href);
+const { createImHostPlugin } = await import(pathToFileURL(resolve(root, 'lib/index.js')).href);
+let deliveryApi;
+await createImHostPlugin().apply({
+  provide(name, service) {
+    if (name === 'dshIm') deliveryApi = service;
+  },
+  // Inspect the published service without starting channels or opening connections.
+  inject() {},
+});
+if (typeof deliveryApi?.createTarget !== 'function') {
+  throw new Error('host bundle must expose dshIm.createTarget; rebuild before publishing');
+}
 
 console.log('Verified dsh-im package artifacts.');

@@ -24,6 +24,7 @@ import { runCompactCommand } from '../shared/compact-command.mjs';
 import { isSharedLocalCommand } from '../shared/command-permission.mjs';
 import { isClearCommand, runClearCommand } from '../shared/clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
+import { isPermissionCommand, runPermissionCommand } from '../shared/permission-command.mjs';
 import {
   isControlCommand,
   runControlCommand,
@@ -73,6 +74,7 @@ import {
   evaluateInboundAccess,
 } from '../shared/inbound-access.mjs';
 import { t } from '../shared/i18n.mjs';
+import { createWecomStreamSupervisor } from './stream-supervisor.mjs';
 
 const DEFAULT_FILE_UPLOAD_TIMEOUT_MS = 120_000;
 
@@ -86,6 +88,8 @@ function helpText() {
     t('/new  开启一个全新会话'),
     t('/compact  压缩当前会话的较早上下文'),
     t('/clear  清空当前会话上下文（保留 Session 绑定和历史记录）'),
+    t('/permissionlist  按序号列出权限档位'),
+    t('/permission [序号或完整ID]  查看或切换当前会话权限'),
     t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
     t('/workspace 工作区序号或绝对路径  切换工作区'),
     t('/workspacelist  列出工作区绝对路径'),
@@ -583,6 +587,8 @@ export class WecomHarnessBridge {
   #status;
   #logger;
   #replyTimeoutMs;
+  #streamRotateAfterMs;
+  #streamSilentProbeMs;
   #generateReqId;
   #signal;
   #fileUploadTimeoutMs;
@@ -610,6 +616,8 @@ export class WecomHarnessBridge {
     status = createWecomBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
+    streamRotateAfterMs = 510_000,
+    streamSilentProbeMs = 120_000,
     generateStreamId = generateReqId,
     fileUploadTimeoutMs = DEFAULT_FILE_UPLOAD_TIMEOUT_MS,
     signal,
@@ -629,6 +637,8 @@ export class WecomHarnessBridge {
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
+    this.#streamRotateAfterMs = streamRotateAfterMs;
+    this.#streamSilentProbeMs = streamSilentProbeMs;
     this.#generateReqId = generateStreamId;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
     this.#signal = signal;
@@ -921,7 +931,8 @@ export class WecomHarnessBridge {
       text: commandText,
       hasImages: hasInboundImages(commandMessage),
       hasFiles: hasInboundFiles(commandMessage),
-      ...(parseWecomMenu(commandText) && !hasInboundImages(commandMessage) && !hasInboundFiles(commandMessage)
+      ...(isPermissionCommand(commandText)
+        || (parseWecomMenu(commandText) && !hasInboundImages(commandMessage) && !hasInboundFiles(commandMessage))
         ? { isCommand: true } : {}),
     });
     if (!access.allowed) {
@@ -976,6 +987,7 @@ export class WecomHarnessBridge {
       && (parseWecomMenu(commandText) || ['/help', '/status', '/new'].includes(commandText.toLowerCase())
         || this.#cardFrames.has(frame));
     const commandRunner = isClearCommand(commandText) ? runClearCommand
+      : isPermissionCommand(commandText) ? runPermissionCommand
       : isHistoryCommand(commandText) ? runHistoryCommand
       : hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
       ? runControlCommand
@@ -1354,6 +1366,7 @@ export class WecomHarnessBridge {
     const key = conversationKey(frame);
     let streamId = null;
     let streamStarted = false;
+    let streamCtl = null;
     let streamThinkingText = t('正在思考中…');
     let streamAnswerText = '';
     let batchSettled = batchSubmission === null;
@@ -1419,6 +1432,17 @@ export class WecomHarnessBridge {
       } catch (error) {
         this.#logger.warn?.('[dsh-im:wecom] unable to start a stream; using an active reply:', error);
       }
+      streamCtl = createWecomStreamSupervisor({
+        client: this.#client,
+        frame,
+        chatId,
+        generateStreamId: () => this.#generateReqId('stream'),
+        previewText: () => splitUtf8(streamContent(streamThinkingText, streamAnswerText))[0],
+        logger: this.#logger,
+        rotateAfterMs: this.#streamRotateAfterMs,
+        silentProbeMs: this.#streamSilentProbeMs,
+      });
+      if (streamStarted) streamCtl.start(streamId);
 
       let content = hasImages || hasReply
         ? await promptContentForInboundMessage(message, { signal: this.#signal, deferImages: true })
@@ -1439,6 +1463,7 @@ export class WecomHarnessBridge {
       await this.#state.markSeen(messageId);
       promptRecorded = true;
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#sendActive(chatId, notice),
         deferredDelivery: () => ({ coordinator: this.#deferred, target: { chatId } }),
         harness: this.#harness,
         state: this.#state,
@@ -1464,7 +1489,7 @@ export class WecomHarnessBridge {
                 const preview = splitUtf8(
                   streamContent(streamThinkingText, streamAnswerText),
                 )[0];
-                if (preview) await this.#client.replyStreamNonBlocking(frame, streamId, preview, false);
+                if (preview) await streamCtl.progress(preview);
               }
             : undefined,
           onInteraction: (interaction) => this.#handleInteraction(interaction, {
@@ -1495,7 +1520,7 @@ export class WecomHarnessBridge {
         if (streamStarted && streamChunks.length > 0) {
           try {
             const providerMessageIds = [];
-            const streamed = await this.#client.replyStream(frame, streamId, streamChunks[0], true);
+            const streamed = await streamCtl.finishStream(streamChunks[0]);
             const streamedMessageId = providerMessageId(streamed);
             if (streamedMessageId) providerMessageIds.push(streamedMessageId);
             for (const chunk of streamChunks.slice(1)) {
@@ -1561,11 +1586,8 @@ export class WecomHarnessBridge {
       }
       if (error?.code === 'turn-stopped') {
         if (streamStarted && streamId) {
-          await this.#client.replyStream(
-            frame,
-            streamId,
+          await streamCtl.finishStream(
             streamContent(streamThinkingText, t('已停止。'), { finish: true }),
-            true,
           )
             .catch(() => undefined);
         }
@@ -1589,12 +1611,9 @@ export class WecomHarnessBridge {
         ? `${errorText}\n\n${batchFailureMessage}`
         : errorText;
       try {
-        if (streamStarted && streamId) {
-          await this.#client.replyStream(
-            frame,
-            streamId,
+        if (streamStarted && streamId && streamCtl.isAlive()) {
+          await streamCtl.finishStream(
             streamContent(streamThinkingText, visibleError, { finish: true }),
-            true,
           );
         } else {
           await this.#sendImmediate(frame, chatId, visibleError);
@@ -1604,6 +1623,7 @@ export class WecomHarnessBridge {
         this.#logger.error?.('[dsh-im:wecom] failed to send the safe error reply');
       }
     } finally {
+      streamCtl?.stop();
       await Promise.allSettled([
         this.#cancelPendingInteraction(key),
         this.#approvals.closeRoute(key),

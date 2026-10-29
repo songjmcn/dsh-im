@@ -455,7 +455,12 @@ test('Enterprise WeChat does not download quoted images for local commands or de
   assert.equal(asks, 0);
   assert.equal(cleared, 1);
   assert.deepEqual(commands, ['/compact']);
-  assert.equal(transport.streamed.some(({ content }) => content.includes('用法：/workspace')), true);
+  // Bare /workspace is the merged listing command now; this fixture's harness does
+  // not expose listWorkspaces, so the explicit degradation text is what surfaces.
+  assert.equal(
+    transport.streamed.some(({ content }) => content.includes('当前机器人暂不支持列出工作区。')),
+    true,
+  );
   assert.equal(transport.streamed.some(({ content }) => content.includes('用法：/session')), true);
 });
 
@@ -591,6 +596,71 @@ test('Enterprise WeChat remembers any private inbound as a connection-test targe
     text: { content: '@机器人 /help' },
   }));
   assert.equal(connectionTestTarget(groupState), null);
+});
+
+test('Enterprise WeChat queries and switches permissions locally for its bound Session', async () => {
+  const transport = testClient();
+  const executed = [];
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      getSessionPermissions: async (id) => {
+        assert.equal(id, 'session-existing');
+        return { currentValue: 'workspace-write', options: [{ value: 'workspace-write' }] };
+      },
+      executeCommand: async (id, line) => {
+        executed.push({ id, line });
+        return { result: { kind: 'success' } };
+      },
+      ask: async () => assert.fail('permission commands must not be submitted to the model'),
+    },
+    state: state(),
+    accessPolicy: directAccessPolicy({ privilegedIds: ['member-1'] }),
+  });
+  for (const command of ['/permission', '/permissionlist', '/permission 1', '/help']) {
+    await bridge.accept(frame({ msgid: command, text: { content: command } }));
+  }
+  assert.deepEqual(executed, [{ id: 'session-existing', line: '/permission workspace-write' }]);
+  const replies = transport.streamed.map(item => item.content).join('\n');
+  assert.match(replies, /当前会话权限：workspace-write/);
+  assert.match(replies, /当前会话权限已切换为：workspace-write/);
+  assert.match(replies, /\/permissionlist  按序号列出权限档位/);
+});
+
+test('Enterprise WeChat permission commands enforce privileged access before reading or writing', async () => {
+  const transport = testClient();
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      getSessionPermissions: async () => assert.fail('permission read must be denied'),
+      executeCommand: async () => assert.fail('permission write must be denied'),
+      ask: async () => assert.fail('denied commands must not become prompts'),
+    },
+    state: state(),
+    accessPolicy: directAccessPolicy({ users: [{ id: 'member-1', canExecuteCommands: false }], privilegedIds: ['owner'] }),
+  });
+  for (const command of ['/permission', '/permissionlist', '/permission workspace-write']) {
+    await bridge.accept(frame({ msgid: command, text: { content: command } }));
+  }
+  assert.equal(transport.streamed.length, 3);
+  assert.ok(transport.streamed.every(item => item.content === COMMAND_PERMISSION_DENIED_MESSAGE));
+});
+
+test('Enterprise WeChat rejects permission commands with media without invoking the model or changing permissions', async () => {
+  const transport = testClient();
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      executeCommand: async () => assert.fail('media must not change permissions'),
+      ask: async () => assert.fail('media command must not become a prompt'),
+    },
+    state: state(),
+  });
+  await bridge.accept(frame({ msgtype: 'mixed', mixed: { msg_item: [
+    { msgtype: 'text', text: { content: '/permission workspace-write' } },
+    { msgtype: 'image', image: { url: 'https://wecom.example/image' } },
+  ] } }));
+  assert.match(transport.streamed.at(-1).content, /权限命令仅支持纯文字/);
 });
 
 test('Enterprise WeChat executes /compact for the bound Session without prompting the model', async () => {
@@ -839,7 +909,7 @@ test('Enterprise WeChat finalizes a failed turn without its last progress text',
   const final = transport.streamed.filter(({ finish }) => finish);
   assert.equal(final.length, 1);
   assert.equal(final[0].streamId, 'error-content-stream');
-  assert.match(final[0].content, /^任务未完成/);
+  assert.match(final[0].content, /任务结果尚未确认.*不要立即重复提交/);
   assert.match(final[0].content, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(final[0].content, /<\/?think>|正在整理结果|private provider failure/);
   assert.equal(transport.streamed.at(-1), final[0]);
@@ -1342,7 +1412,7 @@ test('Enterprise WeChat finalizes an existing progress stream when Harness fails
   assert.equal(replies[1].streamId, 'stream-failure');
   assert.equal(replies[1].finish, true);
   assert.doesNotMatch(replies[1].content, /<\/?think>|正在思考中/);
-  assert.match(replies[1].content, /任务未完成，暂时无法确定原因/);
+  assert.match(replies[1].content, /任务结果尚未确认.*不要立即重复提交/);
   assert.match(replies[1].content, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.equal(store.seen.has('msg-1'), true);
 });

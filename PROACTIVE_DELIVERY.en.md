@@ -201,6 +201,21 @@ const targets = await ctx.dshIm.listTargets(botId);
 // [{ targetId, name?, kind, route }, ...]
 ```
 
+A same-Host plugin may also register a known conversation route as a delivery target. Once registered, that `targetId` can be used with `send` and appears in the settings target list. This example registers a Feishu direct message, so `botId` must belong to a Feishu bot:
+
+```js
+await ctx.dshIm.createTarget(botId, {
+  targetId: 'release-alerts',
+  kind: 'user',
+  route: { openId: 'ou_xxx' },
+  name: 'Release alerts',       // optional
+});
+```
+
+Both `kind` and `route` must match the bot's channel; see [Native fields for all nine channels](#native-fields-for-all-nine-channels). For example, a Feishu group uses `kind: 'group'` with `route: { chatId: 'oc_xxx' }`. A Telegram direct message or group uses `kind: 'chat'` with `route: { chatId: '123456789' }`, where the Chat ID must be a decimal string.
+
+An existing `targetId` is rejected with `target-conflict`; updating or deleting a saved target still goes through the management RPC's `target.update` / `target.delete`.
+
 Companion plugins can discover configured bots through the same Host service:
 
 ```js

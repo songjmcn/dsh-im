@@ -237,6 +237,8 @@ test('QR registration separates events from card callbacks', async () => {
   assert.deepEqual(run.options.addons.callbacks.items, ['card.action.trigger']);
   assert.ok(run.options.addons.scopes.tenant.includes('im:resource'));
   assert.ok(run.options.addons.scopes.tenant.includes('im:message.group_at_msg.include_bot:readonly'));
+  assert.ok(run.options.addons.scopes.tenant.includes('im:message.group_msg'));
+  assert.ok(run.options.addons.scopes.tenant.includes('im:message:readonly'));
   assert.equal(run.options.addons.scopes.tenant.includes('im:resource:upload'), false);
   assert.ok(run.options.addons.scopes.tenant.includes('application:app_slash_command:read'));
   assert.ok(run.options.addons.scopes.tenant.includes('application:app_slash_command:write'));
@@ -246,6 +248,9 @@ test('QR registration separates events from card callbacks', async () => {
     user_info: { open_id: 'ou_callbacks', tenant_brand: 'feishu' },
   });
   await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'succeeded');
+  assert.equal(fx.configStore.getBot('bot_callbacks').groupMessagePermissionGranted, true);
+  assert.equal(fx.controller.status().bots[0].groupMessagePermissionGranted, true);
+  assert.equal(fx.controller.status().bots[0].groupResponseMode, 'mention');
   await fx.controller.close();
 });
 
@@ -493,6 +498,58 @@ test('group-message authorization grants only its scope, enables all mode, and r
   await fx.controller.close();
 });
 
+test('group recording authorization preserves mention mode', async () => {
+  const existing = bot('bot_group_permission', 'group_permission');
+  const fx = fixture({
+    bots: [existing],
+    secrets: { [existing.secretRef]: 'stable-secret' },
+    verifyApp: async () => ({
+      name: existing.botName,
+      openId: existing.botOpenId,
+      activated: existing.activated,
+    }),
+  });
+  await fx.controller.initialize();
+  const oldRuntime = fx.runtimes.get(existing.id)[0];
+
+  const started = fx.controller.startGroupMessagePermission(existing.id, { preserveResponseMode: true });
+  const duplicate = fx.controller.startGroupMessagePermission(existing.id, { preserveResponseMode: true });
+  const attemptId = started.registration.attempt;
+  assert.equal(duplicate.registration.attempt, attemptId);
+  assert.equal(started.registration.operation, 'group_message_permission');
+  assert.equal(started.registration.botId, existing.id);
+
+  await waitFor(() => fx.registrationRuns.length === 1);
+  const run = fx.registrationRuns.shift();
+  assert.equal(run.options.appId, existing.appId);
+  assert.equal(Object.hasOwn(run.options, 'createOnly'), false);
+  assert.deepEqual(run.options.addons, {
+    preset: false,
+    scopes: { tenant: ['im:message.group_msg'] },
+  });
+  run.options.onQRCodeReady({
+    url: callbackRepairQrUrl(existing.appId),
+    expireIn: 60,
+  });
+  run.resolve({
+    client_id: existing.appId,
+    client_secret: 'stable-secret',
+    user_info: { open_id: existing.ownerOpenIds[0], tenant_brand: existing.domain },
+  });
+
+  await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'succeeded');
+  const saved = fx.configStore.getBot(existing.id);
+  assert.equal(saved.groupMessagePermissionGranted, true);
+  assert.equal(saved.groupResponseMode ?? 'mention', 'mention');
+  assert.equal(oldRuntime.stops, 1);
+  assert.equal(fx.runtimes.get(existing.id).length, 2);
+  assert.equal(fx.runtimes.get(existing.id)[1].config.groupResponseMode ?? 'mention', 'mention');
+  const status = fx.controller.registrationStatus(attemptId);
+  assert.equal(status.bots[0].groupMessagePermissionGranted, true);
+  assert.equal(status.bots[0].groupResponseMode, 'mention');
+  await fx.controller.close();
+});
+
 test('cancelling group-message authorization before confirmation preserves mention mode', async () => {
   const existing = bot('bot_group_permission_cancel', 'group_permission_cancel');
   const fx = fixture({
@@ -513,7 +570,7 @@ test('cancelling group-message authorization before confirmation preserves menti
   await fx.controller.close();
 });
 
-test('callback repair is deduplicated per bot, updates only its secret, and proves the callback', async () => {
+test('callback repair is deduplicated per bot, records granted permissions, and proves the callback', async () => {
   const existing = bot('bot_existing', 'existing');
   const fx = fixture({
     bots: [existing],
@@ -553,6 +610,7 @@ test('callback repair is deduplicated per bot, updates only its secret, and prov
         'im:message:readonly',
         'im:resource',
         'im:message.group_at_msg.include_bot:readonly',
+        'im:message.group_msg',
         'application:app_slash_command:read',
         'application:app_slash_command:write',
       ],
@@ -575,11 +633,14 @@ test('callback repair is deduplicated per bot, updates only its secret, and prov
   assert.equal(result.registration.operation, 'callback_repair');
   assert.equal(result.registration.botId, existing.id);
   assert.equal(result.registration.stage, 'verified');
-  assert.deepEqual(fx.configStore.list(), [existing]);
+  assert.deepEqual(fx.configStore.list(), [{ ...existing, groupMessagePermissionGranted: true }]);
+  assert.equal(result.bots[0].groupMessagePermissionGranted, true);
+  assert.equal(result.bots[0].groupResponseMode, 'mention');
   assert.equal(fx.values.get(existing.secretRef), 'rotated-secret');
   assert.equal(history.length, 2);
   assert.equal(oldRuntime.stops, 1);
   assert.equal(history[1].appSecret, 'rotated-secret');
+  assert.equal(history[1].config.groupMessagePermissionGranted, true);
   assert.deepEqual(history[1].probes, [{
     expectedOperatorOpenId: existing.ownerOpenIds[0],
     timeoutMs: 50,
@@ -622,6 +683,56 @@ test('callback repair with an unchanged secret still refreshes the target runtim
     timeoutMs: 50,
   }]);
   await fx.controller.close();
+});
+
+test('permission repair persists group access across reload and preserves both reply modes', async (t) => {
+  for (const mode of ['mention', 'all']) await t.test(mode, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-feishu-permissions-'));
+    const path = join(root, 'bots.json');
+    const store = await new PluginConfigStore(path).load();
+    const existing = await store.saveBot({ ...bot('bot_repair', 'repair'), groupResponseMode: mode,
+      groupMessagePermissionGranted: false, mentionTopicReply: false, stepPush: true });
+    const fx = fixture({ configStore: store, secrets: { [existing.secretRef]: 'stable-secret' },
+      verifyApp: async () => ({ openId: existing.botOpenId }) });
+    t.after(async () => { await fx.controller.close(); await rm(root, { recursive: true, force: true }); });
+    await fx.controller.initialize();
+    const started = fx.controller.startCallbackRepair(existing.id);
+    const attemptId = started.registration.attempt;
+    await waitFor(() => fx.registrationRuns.length === 1);
+    const run = fx.registrationRuns.shift();
+    run.options.onQRCodeReady({ url: callbackRepairQrUrl(existing.appId), expireIn: 60 });
+    run.resolve({ client_id: existing.appId, client_secret: 'stable-secret',
+      user_info: { open_id: existing.ownerOpenIds[0], tenant_brand: 'feishu' } });
+    await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'succeeded');
+    const reloaded = await new PluginConfigStore(path).load();
+    assert.deepEqual(reloaded.getBot(existing.id), { ...existing, groupMessagePermissionGranted: true });
+    assert.equal(fx.controller.status().bots[0].groupMessagePermissionGranted, true);
+    assert.equal(fx.controller.status().bots[0].groupResponseMode, mode);
+    assert.equal(fx.runtimes.get(existing.id).at(-1).config.groupResponseMode, mode);
+  });
+});
+
+test('permission repair reports a failed state save without claiming local activation', async (t) => {
+  const existing = bot('bot_repair_save', 'repair_save');
+  const fx = fixture({ bots: [existing], secrets: { [existing.secretRef]: 'stable-secret' },
+    verifyApp: async () => ({ openId: existing.botOpenId }) });
+  t.after(() => fx.controller.close());
+  await fx.controller.initialize();
+  fx.configStore.saveBot = async () => { throw new Error('private storage diagnostic'); };
+  const started = fx.controller.startCallbackRepair(existing.id);
+  const attemptId = started.registration.attempt;
+  await waitFor(() => fx.registrationRuns.length === 1);
+  const run = fx.registrationRuns.shift();
+  run.options.onQRCodeReady({ url: callbackRepairQrUrl(existing.appId), expireIn: 60 });
+  run.resolve({ client_id: existing.appId, client_secret: 'stable-secret',
+    user_info: { open_id: existing.ownerOpenIds[0], tenant_brand: 'feishu' } });
+  await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'error');
+  const result = fx.controller.registrationStatus(attemptId);
+  assert.equal(result.registration.error.code, 'repair_permissions_save_failed');
+  assert.equal(result.bots[0].groupMessagePermissionGranted, false);
+  assert.deepEqual(fx.configStore.getBot(existing.id), existing);
+  assert.equal(fx.runtimes.get(existing.id).length, 1);
+  assert.doesNotMatch(JSON.stringify(result), /private storage diagnostic/);
 });
 
 test('close drains a repair runtime created after delayed credential verification', async () => {
@@ -722,7 +833,7 @@ test('web callback repair accepts wildcard visibility but probes the precise SDK
   });
 
   await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'succeeded');
-  assert.deepEqual(fx.configStore.list(), [existing]);
+  assert.deepEqual(fx.configStore.list(), [{ ...existing, groupMessagePermissionGranted: true }]);
   const history = fx.runtimes.get(existing.id);
   assert.equal(history.length, 2);
   assert.equal(oldRuntime.stops, 1);
@@ -870,7 +981,7 @@ test('callback repair restart failure keeps the remotely committed secret for re
   await waitFor(() => fx.controller.registrationStatus(attemptId).registration.state === 'error');
   const result = fx.controller.registrationStatus(attemptId);
   assert.equal(result.registration.error.code, 'repair_connection_failed');
-  assert.deepEqual(fx.configStore.list(), [existing]);
+  assert.deepEqual(fx.configStore.list(), [{ ...existing, groupMessagePermissionGranted: true }]);
   assert.equal(fx.values.get(existing.secretRef), 'rotated-secret');
   assert.equal(fx.runtimes.get(existing.id).length, 2);
   assert.equal(fx.runtimes.get(existing.id).at(-1).appSecret, 'rotated-secret');
@@ -950,6 +1061,7 @@ test('manual Feishu credentials are verified, stored host-side, and use app visi
   });
 
   assert.equal(status.totals.connected, 1);
+  assert.equal(status.bots[0].groupMessagePermissionGranted, false, 'manual binding alone does not prove granted scopes');
   assert.equal(fx.configStore.bots.length, 1);
   assert.deepEqual(fx.configStore.bots[0].ownerOpenIds, ['*']);
   assert.equal(fx.values.get(fx.configStore.bots[0].secretRef), 'manual-private-secret');

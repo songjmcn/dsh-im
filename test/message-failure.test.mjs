@@ -11,6 +11,18 @@ import {
 
 const options = { referenceId: 'MF-TEST01', at: 123 };
 
+test('missing Sessions accept both RPC codes without changing the original error', () => {
+  for (const code of ['session-not-found', 'session/not-found']) {
+    const error = Object.freeze({ code, message: 'private session path' });
+    const failure = classifyMessageFailure(error, options);
+    assert.equal(failure.code, 'SESSION_NOT_FOUND');
+    assert.equal(failure.reason, 'SESSION_NOT_FOUND');
+    assert.match(failure.message, /\/new/u);
+    assert.doesNotMatch(JSON.stringify(failure), /private session path/u);
+    assert.equal(error.code, code);
+  }
+});
+
 test('unknown transport failures reuse normalized timeout and network evidence', () => {
   for (const [error, code, reason] of [
     [new DOMException('private timeout detail', 'TimeoutError'), 'REQUEST_TIMEOUT', 'timeout'],

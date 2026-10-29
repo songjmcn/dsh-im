@@ -71,6 +71,185 @@ function fakeContext(gateway) {
   };
 }
 
+function catalogFixture() {
+  const reads = [];
+  let catalog = {
+    groups: [{ id: 'provider', name: 'Provider', models: [{ id: 'model', name: 'Model' }] }],
+    failures: [],
+  };
+  let read = () => structuredClone(catalog);
+  const { ctx } = fakeContext({
+    stream() { assert.fail('model lists do not need streams'); },
+    invoke(request) {
+      assert.equal(`${request.namespace}/${request.method}`, 'session/modelCatalog');
+      assert.deepEqual(request.args, {});
+      reads.push(request);
+      return read();
+    },
+  });
+  const disposers = [];
+  ctx.effect = (setup) => { disposers.push(setup()); };
+  const client = () => new HarnessClient({ ...harnessConnection(ctx), workspace: '/workspace' });
+  return {
+    ctx, reads, client, api: modernHarnessApi(ctx),
+    dispose() { for (const dispose of disposers.splice(0).reverse()) dispose(); },
+    get catalog() { return catalog; },
+    set catalog(value) { catalog = value; },
+    set read(value) { read = value; },
+  };
+}
+
+test('model catalogs share one successful read per Host and expire lazily after 30 seconds', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000 });
+  const f = catalogFixture();
+  const one = f.client();
+  const two = f.client();
+  for (let second = 0; second < 60; second += 1) {
+    const values = await Promise.all([one.listModels(), two.listModels()]);
+    assert.deepEqual(values[0], f.catalog);
+    assert.notEqual(values[0], values[1]);
+    values[0].groups[0].models[0].name = 'caller mutation';
+    t.mock.timers.tick(1_000);
+  }
+  assert.equal(f.reads.length, 2);
+  t.mock.timers.tick(90_000);
+  assert.equal(f.reads.length, 2, 'expiry does not start a background refresh');
+  assert.deepEqual(await one.listModels(), f.catalog);
+  assert.equal(f.reads.length, 3);
+  const other = catalogFixture();
+  await other.client().listModels();
+  assert.equal(other.reads.length, 1, 'different Hosts have independent catalogs');
+});
+
+test('concurrent catalog callers share a pending read and TTL starts on success', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000 });
+  const f = catalogFixture();
+  const gate = Promise.withResolvers();
+  f.read = () => gate.promise;
+  const pending = Array.from({ length: 8 }, () => f.client().listModels());
+  await new Promise(setImmediate);
+  assert.equal(f.reads.length, 1);
+  t.mock.timers.tick(20_000);
+  gate.resolve(f.catalog);
+  await Promise.all(pending);
+  t.mock.timers.tick(29_999);
+  await f.client().listModels();
+  assert.equal(f.reads.length, 1);
+  t.mock.timers.tick(1);
+  await Promise.all([f.client().listModels(), f.client().listModels()]);
+  assert.equal(f.reads.length, 2);
+});
+
+test('fresh model reads bypass pending work and prevent late cache repopulation', async () => {
+  const f = catalogFixture();
+  const client = f.client();
+  const old = Promise.withResolvers();
+  f.read = () => old.promise;
+  const pending = client.listModels();
+  await new Promise(setImmediate);
+  const latest = { groups: [], failures: [{ id: 'provider', name: 'Unavailable' }] };
+  f.read = () => latest;
+  assert.deepEqual(await client.listModels({ fresh: true }), latest);
+  assert.equal(f.reads.length, 2);
+  assert.deepEqual(await client.listModels(), latest);
+  old.resolve(f.catalog);
+  assert.deepEqual(await pending, f.catalog);
+  assert.deepEqual(await client.listModels(), latest);
+  assert.equal(f.reads.length, 3, 'late old read must not replace the current cache');
+  f.read = () => { throw new Error('fresh failed'); };
+  await assert.rejects(client.listModels({ fresh: true }), /fresh failed/);
+  f.read = () => f.catalog;
+  assert.deepEqual(await client.listModels(), f.catalog);
+  assert.equal(f.reads.length, 5, 'failed fresh reads also invalidate cached data');
+});
+
+test('failed and malformed catalog reads are retried; valid empty catalogs are cached', async () => {
+  const f = catalogFixture();
+  const client = f.client();
+  f.read = () => { throw new Error('offline'); };
+  await assert.rejects(client.listModels(), /offline/);
+  f.read = () => ({ groups: null, failures: [] });
+  await assert.rejects(client.listModels(), /invalid response/);
+  f.read = () => ({ groups: [], failures: [] });
+  assert.deepEqual(await client.listModels(), { groups: [], failures: [] });
+  await client.listModels();
+  assert.equal(f.reads.length, 3);
+});
+
+test('catalog cancellation affects only the caller; disposal aborts shared reads', async () => {
+  const f = catalogFixture();
+  const client = f.client();
+  const cancelled = new AbortController();
+  cancelled.abort(new Error('already cancelled'));
+  await assert.rejects(client.listModels({ signal: cancelled.signal }), /already cancelled/);
+  assert.equal(f.reads.length, 0);
+  const gate = Promise.withResolvers();
+  f.read = () => gate.promise;
+  const caller = new AbortController();
+  const first = client.listModels({ signal: caller.signal });
+  const stopped = assert.rejects(first, /caller stopped/);
+  const second = f.client().listModels();
+  await new Promise(setImmediate);
+  caller.abort(new Error('caller stopped'));
+  await stopped;
+  assert.equal(f.reads.length, 1);
+  assert.equal(f.reads[0].signal.aborted, false);
+  gate.resolve(f.catalog);
+  assert.deepEqual(await second, f.catalog);
+
+  await client.listModels({ fresh: true });
+  const late = Promise.withResolvers();
+  f.read = () => late.promise;
+  const read = client.listModels();
+  const disposed = assert.rejects(read);
+  await new Promise(setImmediate);
+  f.dispose();
+  await disposed;
+  assert.equal(f.reads.at(-1).signal.aborted, true);
+  late.resolve(f.catalog);
+  f.read = () => f.catalog;
+  const before = f.reads.length;
+  assert.notEqual(modernHarnessApi(f.ctx), f.api);
+  await f.client().listModels();
+  assert.equal(f.reads.length, before + 1, 'recreated adapter does not retain the old catalog');
+});
+
+test('a shared catalog read may complete after its only caller cancels', async () => {
+  const f = catalogFixture();
+  const gate = Promise.withResolvers();
+  f.read = () => gate.promise;
+  const caller = new AbortController();
+  const pending = f.client().listModels({ signal: caller.signal });
+  const stopped = assert.rejects(pending, { name: 'AbortError' });
+  await new Promise(setImmediate);
+  caller.abort();
+  await stopped;
+  gate.resolve(f.catalog);
+  await new Promise(setImmediate);
+  assert.deepEqual(await f.client().listModels(), f.catalog);
+  assert.equal(f.reads.length, 1);
+});
+
+test('catalog RPC timeout releases the pending slot even when the gateway ignores cancellation', async (t) => {
+  const timeouts = [];
+  t.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+    assert.ok([5_000, 30_000].includes(milliseconds));
+    const controller = new AbortController();
+    timeouts.push(controller);
+    return controller.signal;
+  });
+  const f = catalogFixture();
+  f.read = () => new Promise(() => {});
+  const pending = f.client().listModels();
+  const timedOut = assert.rejects(pending, { code: 'harness-timeout' });
+  await new Promise(setImmediate);
+  timeouts.at(-1).abort(new DOMException('Timed out', 'TimeoutError'));
+  await timedOut;
+  f.read = () => f.catalog;
+  assert.deepEqual(await f.client().listModels(), f.catalog);
+  assert.equal(f.reads.length, 2);
+});
+
 test('modern workspace baseline detects an archived binding without loading its Session', async () => {
   const calls = [];
   const { ctx } = fakeContext({

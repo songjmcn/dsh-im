@@ -165,17 +165,29 @@ test('the funnel drops by fixed gate order and keeps shapes well', () => {
   ok(media.message && media.message.images.length === 1);
 });
 
-test('group messages pass only through mention, command or reply relations', () => {
+test('group messages pass through mention, command or an opted-in reply relation', () => {
   deepStrictEqual(funnel(event()), { drop: 'mention-required' });
   const mentioned = funnel(event({}, { body: 'hi <@bot:example.org>', 'm.mentions': { user_ids: ['@bot:example.org'] } }));
   ok(mentioned.message.addressed && mentioned.message.mentioned);
   const command = funnel(event({}, { body: '/help' }));
   ok(command.message.addressed && !command.message.mentioned);
-  const replied = funnel(event({}, {
+  const unaddressedReply = funnel(event({}, {
     body: 'follow up',
     'm.relates_to': { 'm.in_reply_to': { event_id: '$orig:example.org' } },
   }));
-  ok(replied.message.addressed, 'a reply relation counts as addressed');
+  deepStrictEqual(unaddressedReply, { drop: 'mention-required' },
+    'the shipped policy keeps an unaddressed reply a recorded fact: no @, no wake');
+  const repliedBotOnly = funnel(event({}, {
+    body: 'follow up',
+    'm.relates_to': { 'm.in_reply_to': { event_id: '$orig:example.org' } },
+  }), { config: { triggerOnReply: 'bot-only' } });
+  deepStrictEqual(repliedBotOnly, { drop: 'reply-target-unknown' },
+    'bot-only without a classifier cannot vouch for the target and stays silent');
+  const replied = funnel(event({}, {
+    body: 'follow up',
+    'm.relates_to': { 'm.in_reply_to': { event_id: '$orig:example.org' } },
+  }), { config: { triggerOnReply: 'any' } });
+  ok(replied.message.addressed, 'a room may opt the 4.25-era reply shape back on');
   deepStrictEqual(replied.message.replyTarget,
     { roomId: ROOM, recipientUserId: '@alice:example.org', replyToEventId: '$orig:example.org' });
   const threaded = funnel(event({}, {
@@ -218,4 +230,101 @@ test('delivery targets round-trip through the conversation-key grammar', () => {
     matrixConversationKeyFromTarget({ kind: 'thread', roomId: ROOM, threadId: '$t:x.org' }),
     'room:!roomA:example.org$$t:x.org',
   );
+});
+
+test('genuine reply relations are read from both protocol forms and either fallback marker position demotes them', () => {
+  const legacyReply = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复某条消息',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$legacytarget:example.org' },
+  }));
+  deepStrictEqual(legacyReply.message.replyToEventId, '$legacytarget:example.org',
+    'the top-level legacy reply relation carries the reply target');
+  const newFormReply = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复某条消息',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': { event_id: '$newtarget:example.org', rel_type: 'm.reply' },
+  }));
+  deepStrictEqual(newFormReply.message.replyToEventId, '$newtarget:example.org',
+    'the new-form relation with rel_type m.reply carries the reply target');
+  const protocolFallback = funnel(event({}, {
+    body: 'hi <@bot:example.org> 线程内继续发言',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$threadC:example.org' },
+    'm.relates_to': { event_id: '$threadC:example.org', rel_type: 'm.thread', is_falling_back: true },
+  }));
+  deepStrictEqual(protocolFallback.message.replyToEventId, null,
+    'the marker under m.relates_to demotes the sibling reply declaration to thread membership');
+  deepStrictEqual(protocolFallback.message.threadId, '$threadC:example.org',
+    'the thread relation still carries the membership through');
+  deepStrictEqual(protocolFallback.message.conversationId, 'room:!roomA:example.org$$threadC:example.org',
+    'a protocol-form fallback post inside a thread forks the thread conversation instead of the mainline');
+  const legacyFallback = funnel(event({}, {
+    body: 'hi <@bot:example.org> 线程内继续发言',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$threadC:example.org', is_falling_back: true },
+  }));
+  deepStrictEqual(legacyFallback.message.replyToEventId, null,
+    'the marker at the legacy position keeps demoting the reply declaration');
+});
+
+test('a falling-back thread relation is membership and never a reply', () => {
+  const continuing = funnel(event({}, {
+    body: 'hi <@bot:example.org> 线程内继续发言',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$threadA:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$threadA:example.org', is_falling_back: true },
+    },
+  }));
+  ok(continuing.message.mentioned, 'the mention inside the thread still passes the gate');
+  deepStrictEqual(continuing.message.replyToEventId, null,
+    'a falling-back relation is thread membership, not a human reply');
+  deepStrictEqual(continuing.message.threadId, '$threadA:example.org', 'the thread relation still carries the membership');
+  const inherited = funnel(event({}, {
+    body: '线程内再次继续发言',
+    'm.relates_to': {
+      chain: [{ event_id: '$threadA:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$threadA:example.org', is_falling_back: true },
+    },
+  }), { config: { requireMention: false } });
+  deepStrictEqual(inherited.message.conversationId, 'room:!roomA:example.org$$threadA:example.org',
+    'the automatically attached thread-membership declaration never selects a conversation: posts inside a thread fork the thread conversation');
+  const realReply = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复某条消息',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$threadA:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$target:example.org' },
+    },
+  }));
+  deepStrictEqual(realReply.message.replyToEventId, '$target:example.org',
+    'a real reply relation without the fallback flag keeps its target');
+});
+
+test('the fork policy inherits only replies to a human thread-opening root', () => {
+  // A genuine reply whose root is its own target opened the thread at a human
+  // mainline message: the answer belongs to the mainline conversation.
+  const opening = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复主聊消息开话题',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$threadR:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$threadR:example.org' },
+    },
+  }));
+  deepStrictEqual(opening.message.conversationId, 'room:!roomA:example.org',
+    'a genuine reply to the thread-opening root inherits the main conversation');
+  // A genuine reply to a root the bot authored — the panel under a bot answer —
+  // is its own message list and forks the thread conversation instead.
+  const toBotAnswer = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复 bot 的回答气泡',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$botAnswer:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$botAnswer:example.org' },
+    },
+  }), { deps: { isBotRoomEvent: (roomId, eventId) => eventId === '$botAnswer:example.org' } });
+  deepStrictEqual(toBotAnswer.message.conversationId, 'room:!roomA:example.org$$botAnswer:example.org',
+    'a reply to a bot-authored root forks the thread conversation rather than joining the mainline turn');
 });

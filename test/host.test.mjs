@@ -35,6 +35,9 @@ test('Host resolves the bot message language before channels start and serves it
     installHostLanguageRpc: (_ctx, given, authority) => {
       order.push(['language-rpc', given === controller, authority]);
     },
+    installSidebarSettingsRpc: (_ctx, { config }) => {
+      order.push(['sidebar-rpc', config.rpcAuthority, config.language]);
+    },
     applyTelegram: async () => { order.push(['telegram', resolved]); },
   });
 
@@ -47,6 +50,8 @@ test('Host resolves the bot message language before channels start and serves it
   assert.deepEqual(order[0], ['language', 'en']);
   assert.deepEqual(order.find(([kind]) => kind === 'language-rpc'),
     ['language-rpc', true, 'trusted-host']);
+  assert.deepEqual(order.find(([kind]) => kind === 'sidebar-rpc'),
+    ['sidebar-rpc', 'trusted-host', 'en']);
   assert.deepEqual(order.find(([kind]) => kind === 'telegram'), ['telegram', true]);
 });
 
@@ -109,11 +114,16 @@ test('Host composes IM channels and the AI Office connector inside one plugin co
 test('Host provides #65 and installs #84 with the same delivery service', async () => {
   const sent = [];
   const historyReads = [];
+  const created = [];
   const deliveryService = {
     async historyChecked(...args) { historyReads.push(args); return {events:[],hasMore:false}; },
     async send(...args) { sent.push(args); return { sent: true }; },
     async listTargets(botId) {
       return { botId, channel: 'telegram', targets: [{ targetId: 'target' }] };
+    },
+    async createTarget(...args) {
+      created.push(args);
+      return { targetId: args[1].targetId };
     },
     async listBots() { return [{ botId: 'bot_one', channel: 'telegram' }]; },
   };
@@ -148,6 +158,11 @@ test('Host provides #65 and installs #84 with the same delivery service', async 
   assert.equal(http[0][1], deliveryService);
   assert.ok(channelServices.every((service) => service === deliveryService));
   assert.deepEqual(await provided[0][1].listTargets('bot_one'), [{ targetId: 'target' }]);
+  assert.deepEqual(
+    await provided[0][1].createTarget('bot_one', { targetId: 'new-target', kind: 'chat', route: { chatId: '123456789' } }),
+    { targetId: 'new-target' },
+  );
+  assert.deepEqual(created, [['bot_one', { targetId: 'new-target', kind: 'chat', route: { chatId: '123456789' } }]]);
   assert.deepEqual(await provided[0][1].listBots(), [{ botId: 'bot_one', channel: 'telegram' }]);
   assert.deepEqual(await provided[0][1].send('bot_one', 'target', 'hello'), { sent: true });
   assert.deepEqual(sent, [['bot_one', 'target', 'hello', undefined]]);

@@ -869,6 +869,7 @@ export class WeixinHarnessBridge {
         await this.#state.markSeen(messageId);
         promptRecorded = true;
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
+          onNotice: (notice) => this.#send(sender, notice, contextToken, runId, { stopTyping: false }),
           deferredDelivery: () => ({ coordinator: this.#deferred, target: { toUserId: sender } }),
           harness: this.#harness,
           state: this.#state,

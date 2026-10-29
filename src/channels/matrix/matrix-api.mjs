@@ -250,6 +250,24 @@ export class MatrixApi {
     return await this.#request('whoami', { path: '/account/whoami', signal: options.signal });
   }
 
+  /**
+   * Reads one member's display name from the room state. The Matrix profile
+   * field is optional, so a homeserver without the member or without a name
+   * reads as null rather than an error.
+   * @param roomId - the room whose state to read.
+   * @param userId - the member's fully-qualified Matrix user id.
+   * @param options - `{ signal }` forwarding options.
+   * @returns {Promise<string|null>} the trimmed display name, or null when absent.
+   */
+  async getRoomMemberDisplayName(roomId, userId, options = {}) {
+    const event = await this.#request(`room member ${userId}`, {
+      path: `/rooms/${encodeURIComponent(roomId)}/state/members/${encodeURIComponent(userId)}`,
+      signal: options.signal,
+    }).catch(() => null);
+    const name = cleanString(event?.content?.displayname);
+    return name && name.length <= 256 ? name : null;
+  }
+
   async login({ identifier, password, deviceId, displayName }, options = {}) {
     const body = {
       type: 'm.login.password',
@@ -335,6 +353,22 @@ export class MatrixApi {
       signal: options.signal,
     });
   }
+
+  /**
+   * Single-event lookup used by the conversation context collectors to resolve a
+   * reply or thread root outside the retained sync window. The homeserver answers
+   * 404 for an unknown event, so a miss travels as null instead of an exception;
+   * an E2EE room returns the still-encrypted event and the caller decrypts it.
+   */
+  async getEvent(roomId, eventId, options = {}) {
+    if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix event lookup target is invalid');
+    return await this.#request('event', {
+      path: `/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`,
+      timeoutMs: 10_000,
+      signal: options.signal,
+    }).catch(() => null);
+  }
+
 
   async listRelations(roomId, eventId, relationType, options = {}) {
     if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix relation query target is invalid');

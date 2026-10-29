@@ -127,7 +127,7 @@ export async function createProductionController(ctx, config = {}, internals = {
     ...(sessionMaintenanceExecutor ? { sessionMaintenanceExecutor } : {}),
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const knownCommandNames = new Set(
     commandsForChannel('matrix').flatMap((entry) => [entry.name, ...entry.aliases.map((alias) => alias.name)]),
   );

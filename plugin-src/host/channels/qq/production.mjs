@@ -1,3 +1,4 @@
+import { getGroupHistoryStore } from '../../group-history-runtime.mjs';
 import { getImageInputSettingsStore } from '../../../../src/channels/shared/image-input-settings-store.mjs';
 import { unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -108,7 +109,7 @@ export async function createProductionController(ctx, config = {}, internals = {
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
     imageInputPolicy: () => getImageInputSettingsStore(config).get(),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const coreController = new Controller({
     qrAuth,
     credentials: ctx.credentials,
@@ -121,6 +122,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         initialAccessPolicy: newBotAccessPolicyFor('qq', botConfig),
       });
       const workspaceScope = createBotWorkspaceScope(harness, {
+        dsBot: config.deliveryService?.dsBot,
         botId, workspaces, state, agentPresetCatalog,
       });
       return new Runtime({
@@ -128,6 +130,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         appSecret,
         harness: workspaceScope.harness,
         state: workspaceScope.state,
+        groupHistory: internals.groupHistory ?? getGroupHistoryStore(ctx, config),
         contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
         accessPolicy: accessPolicyProvider(workspaces, botId, {
           channel: 'qq', config: botConfig,
@@ -171,7 +174,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   }).start();
   return {
     controller,
-    deliveryAdapter: createDeliveryAdapter({ channel: 'qq', workspaces, coreController, stateFor }),
+    deliveryAdapter: createDeliveryAdapter({ dsBot: config.deliveryService?.dsBot, channel: 'qq', workspaces, coreController, stateFor }),
     ready: supervisor.ready,
     async close() {
       await supervisor.close();

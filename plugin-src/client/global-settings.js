@@ -1,3 +1,5 @@
+import { GroupHistorySettings } from './group-history-settings.js';
+import { SidebarSettings } from './sidebar-settings.js';
 import * as React from 'react';
 
 import {
@@ -5,7 +7,7 @@ import {
   INBOUND_TTL_MAX_HOURS,
   normalizeInboundTtlHours,
 } from '../../src/channels/shared/inbound-ttl.mjs';
-import { h } from './i18n.js';
+import { h, localizeTemplate } from './i18n.js';
 import { DEFAULT_IMAGE_INPUT_SETTINGS, normalizeImageInputSettings } from '../../src/channels/shared/image-input-policy.mjs';
 
 export const GLOBAL_SETTINGS_RPC_CHANNEL = '/dsh-im-settings';
@@ -147,7 +149,7 @@ export function ImageInputSettings({ rpcCall }) {
     phase === 'loading' ? h('p', { className: 'dim-globalInline dim-imageSettingsFeedback', role: 'status' }, '正在读取图片设置…') : null);
 }
 
-export function GlobalSettingsPanel({ rpcCall }) {
+function AttachmentSettingsPanel({ rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [loadError, setLoadError] = React.useState(null);
   const [ttlInput, setTtlInput] = React.useState('');
@@ -275,7 +277,10 @@ export function GlobalSettingsPanel({ rpcCall }) {
   const inlineStatus = phase === 'loading'
     ? { role: 'status', message: '正在读取通用设置…' }
     : ttlError
-      ? { role: 'alert', message: `请输入 -1、0 或 1~${INBOUND_TTL_MAX_HOURS} 之间的整数。` }
+      ? {
+        role: 'alert',
+        message: localizeTemplate('请输入 -1、0 或 1~{max} 之间的整数。', { max: INBOUND_TTL_MAX_HOURS }),
+      }
       : saveError
         ? { role: 'alert', message: saveError }
         : phase === 'error' && loadError
@@ -290,28 +295,9 @@ export function GlobalSettingsPanel({ rpcCall }) {
     && proposedTtl !== null
     && proposedTtl !== savedTtl;
 
-  return h('section', { className: 'dim-generalSettingsPage', 'aria-label': '通用设置' },
-    h('header', { className: 'dim-generalSettingsHeader' },
-      h('h2', null, '通用设置')),
-    h('div', { className: 'dim-generalSettingsTabsBar' },
-      h('div', {
-        className: 'dim-generalSettingsTabs',
-        role: 'tablist',
-        'aria-label': '通用设置分类',
-      },
-      h('button', {
-        type: 'button',
-        id: ATTACHMENTS_TAB_ID,
-        className: 'dim-generalSettingsTab',
-        role: 'tab',
-        'aria-selected': true,
-        'aria-controls': ATTACHMENTS_PANEL_ID,
-      }, '附件'))),
-    h('div', {
-      id: ATTACHMENTS_PANEL_ID,
-      className: 'dim-generalSettingsTabPanel',
-      role: 'tabpanel',
-      'aria-labelledby': ATTACHMENTS_TAB_ID,
+  return h('div', {
+      id: ATTACHMENTS_PANEL_ID, className: 'dim-generalSettingsTabPanel',
+      role: 'tabpanel', 'aria-labelledby': ATTACHMENTS_TAB_ID,
     },
     h('section', {
       className: 'dim-globalSection',
@@ -429,5 +415,28 @@ export function GlobalSettingsPanel({ rpcCall }) {
           'aria-live': inlineStatus.role === 'status' ? 'polite' : undefined,
         }, inlineStatus.message)
         : null)),
-    h(ImageInputSettings, { rpcCall })));
+    h(ImageInputSettings, { rpcCall }));
+}
+
+export function GlobalSettingsPanel({ rpcCall }) {
+  const [tab, setTab] = React.useState('general');
+  const tabs = [{ key: 'general', label: '通用' }, { key: 'attachments', label: '附件' }];
+  return h('section', { className: 'dim-generalSettingsPage', 'aria-label': '通用设置' },
+    h('header', { className: 'dim-generalSettingsHeader' }, h('h2', null, '通用设置')),
+    h('div', { className: 'dim-generalSettingsTabsBar' },
+      h('div', { className: 'dim-generalSettingsTabs', role: 'tablist', 'aria-label': '通用设置分类' },
+        ...tabs.map((item) => h('button', {
+          key: item.key, type: 'button', id: `dim-general-settings-tab-${item.key}`,
+          className: 'dim-generalSettingsTab', role: 'tab', 'aria-selected': tab === item.key,
+          'aria-controls': `dim-general-settings-panel-${item.key}`, tabIndex: tab === item.key ? 0 : -1,
+          onClick: () => setTab(item.key), onKeyDown: (event) => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === 'Home' ? 'general' : event.key === 'End' ? 'attachments' : tab === 'general' ? 'attachments' : 'general';
+            setTab(next); globalThis.document?.getElementById(`dim-general-settings-tab-${next}`)?.focus();
+          },
+        }, item.label)))),
+    tab === 'general' ? h('div', { id: 'dim-general-settings-panel-general', className: 'dim-generalSettingsTabPanel', role: 'tabpanel',
+      'aria-labelledby': 'dim-general-settings-tab-general' }, h(SidebarSettings, { rpcCall }), h(GroupHistorySettings, { rpcCall }))
+      : h(AttachmentSettingsPanel, { rpcCall }));
 }

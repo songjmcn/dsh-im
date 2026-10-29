@@ -7,26 +7,38 @@ const OPERATIONS = new Set([
   'bot.workspace.set', 'bot.model.set', 'bot.agent-preset.set', 'bot.context-enhancement.set', 'bot.access-policy.set', 'bot.alias.set',
 ]);
 const STAGES = new Set([
+  'session.prepare', 'prompt.prepare', 'interaction.open', 'prompt.submit', 'reply.wait',
   'credential.verify', 'permission.check', 'sdk.load', 'operation', 'message.receive', 'message.send', 'connection.test', 'startup.load', 'qr.begin', 'qr.encode', 'qr.poll', 'qr.verify', 'qr.cancel', 'credential.read', 'credential.save', 'credential.remove',
   'account.save', 'account.remove', 'state.load', 'state.write', 'state.cleanup', 'workspace.write', 'workspace.cleanup',
   'runtime.prepare', 'activation', 'harness.check', 'connection.start', 'connection.poll', 'connection.stop', 'status.read', 'rollback', 'management.request',
 ]);
 const REASONS = new Set([
+  'session-log-corrupt',
+  'stream-closed-before-open', 'stream-failed-before-open', 'stream-failed',
   'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'EPIPE',
   'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
   'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN',
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID', 'ERR_SSL_WRONG_VERSION_NUMBER',
   'ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'EROFS', 'ENOTDIR', 'EISDIR', 'EBUSY', 'EIO', 'EXDEV', 'EMFILE', 'ENFILE', 'EEXIST',
+  'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_OUT_OF_RANGE', 'ERR_BUFFER_OUT_OF_BOUNDS',
+  'ERR_ZLIB_INITIALIZATION_FAILED', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_PREMATURE_CLOSE',
+  'Z_STREAM_ERROR', 'Z_DATA_ERROR', 'Z_MEM_ERROR', 'Z_BUF_ERROR', 'Z_VERSION_ERROR',
+  'MODULE_NOT_FOUND', 'ERR_MODULE_NOT_FOUND',
   'unknown', 'multiple-causes', 'timeout', 'http-error', 'provider-rejected', 'invalid-response', 'ERR_PROXY_CONNECTION_FAILED', 'ERR_TLS_HANDSHAKE_TIMEOUT', 'ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR', 'ERR_NETWORK_ACCESS_DENIED', 'AUTHENTICATIONFAILED', 'EAUTH', 'invalid-json', 'invalid-config', 'read-only',
 ]);
 const RESOURCES = new Set(['credential-store', 'account-config', 'account-state', 'workspace-config', 'workspace-directory']);
 const RPC_METHODS = new Set([
-  'host.describe', 'workspace.list', 'workspace.create', 'session.list', 'session.create',
+  'host.describe', 'workspace.list', 'workspace.create', 'session.list', 'session.create', 'session.adopt',
   'session.history', 'session.prompt', 'session.rename', 'session.cancel', 'session.models',
   'session.permissions', 'session.selectModel', 'llm.models',
 ]);
-const TRANSPORTS = new Set(['host-api', 'http']);
+const TRANSPORTS = new Set(['host-api', 'http', 'websocket']);
+const SUBMISSION_STATES = new Set(['not-submitted', 'accepted', 'unknown']);
 const CONFIG_FILES = new Set(['config.json', 'workspaces.json']);
+export const DIAGNOSTIC_ERROR_TYPES = new Set([
+  'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AggregateError',
+  'DOMException', 'AxiosError', 'TimeoutError', 'AbortError',
+]);
 export const CONFIG_ISSUE_LABELS = Object.freeze({
   'expected-object': '应为 JSON 对象。',
   'expected-array': '应为 JSON 数组。',
@@ -50,21 +62,28 @@ const CONFIG_FIELD = /^(?:\$|version|accounts(?:\[\d{1,10}\](?:\.(?:accountId|ow
 export function normalizeDiagnosticDetails(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const result = {};
-  for (const [field, allowed] of [['operation', OPERATIONS], ['stage', STAGES], ['reason', REASONS], ['resource', RESOURCES], ['method', RPC_METHODS], ['transport', TRANSPORTS]]) {
+  for (const [field, allowed] of [['operation', OPERATIONS], ['stage', STAGES], ['reason', REASONS], ['resource', RESOURCES], ['method', RPC_METHODS], ['transport', TRANSPORTS], ['submissionState', SUBMISSION_STATES], ['lastFailureReason', REASONS]]) {
     if (allowed.has(value[field])) result[field] = value[field];
   }
   if (DIAGNOSTIC_CHANNELS.includes(value.channel)) result.channel = value.channel;
+  if (Array.isArray(value.errorTypes)) {
+    const errorTypes = [...new Set(value.errorTypes.filter(type => DIAGNOSTIC_ERROR_TYPES.has(type)))];
+    if (errorTypes.length) result.errorTypes = errorTypes;
+  }
+  if (value.qrEncoder === 'qrcode') result.qrEncoder = value.qrEncoder;
+  if (value.qrRenderer === 'png') result.qrRenderer = value.qrRenderer;
   if (Array.isArray(value.reasons)) {
     const reasons = [...new Set(value.reasons.filter(v => REASONS.has(v) && !['unknown', 'multiple-causes'].includes(v)))].slice(0, 16);
     if (reasons.length) result.reasons = reasons;
   }
   for (const field of ['durationMs', 'timeoutMs']) if (Number.isFinite(value[field]) && value[field] >= 0) result[field] = Math.round(value[field]);
+  if (Number.isSafeInteger(value.attempts) && value.attempts >= 0) result.attempts = value.attempts;
   for (const field of ['nodeVersion', 'dshVersion']) if (typeof value[field] === 'string' && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(value[field]) && value[field].length < 80) result[field] = value[field];
   if (['darwin', 'linux', 'win32', 'freebsd'].includes(value.platform)) result.platform = value.platform;
   if (['ilinkai.weixin.qq.com', 'oapi.dingtalk.com', 'api.dingtalk.com', 'api.telegram.org', 'discord.com', 'slack.com', 'open.feishu.cn', 'qyapi.weixin.qq.com'].includes(value.host)) result.host = value.host;
   if (value.dependencies && typeof value.dependencies === 'object') {
     const dependencies = {};
-    for (const name of ['dingtalkStream', 'axios', 'httpsProxyAgent', 'agentBase']) {
+    for (const name of ['dingtalkStream', 'axios', 'httpsProxyAgent', 'agentBase', 'qrcode', 'pngjs', 'zlib']) {
       const version = value.dependencies[name];
       if (typeof version === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version) && version.length <= 80) dependencies[name] = version;
     }

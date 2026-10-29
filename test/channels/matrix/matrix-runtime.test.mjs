@@ -21,7 +21,10 @@ async function makeTempDirectory(prefix) {
 }
 
 after(async () => {
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  // Windows transient locks (antivirus, straggling handles) surface as EBUSY on
+  // recursive deletes under the full-suite's 200+ worker concurrency; fs.rm's
+  // built-in retry absorbs them without turning cleanup into a test failure.
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function eventually(predicate, timeoutOrLabel = 2_000, labelMaybe) {
@@ -604,6 +607,9 @@ test('bang commands resolve only through the known command catalog', async () =>
   const bang = messageEvent({ body: '!new', content: {} });
   const unknown = messageEvent({ body: '!deploy', content: {} });
   const context = await createContext({
+    // The fold window adds its full span before the forwarded `!deploy` dispatches;
+    // this test pins the command catalog, not the follow-up timing.
+    config: { coalesceWindowMs: 0 },
     isKnownCommand: (name) => ['new', 'compact', 'help', 'stop'].includes(name.replace(/^\/+/, '')),
     apiOptions: {
       initial: {
@@ -914,7 +920,7 @@ test('a live crypto engine decrypts inbound megolm traffic, seals outbound sends
   }
 });
 
-test('the bot own room messages are neither recorded nor presented as other member speech', async () => {
+test('the bot own room messages are stored as bot answers, never as other member speech', async () => {
   const own = messageEvent({ sender: BOT, body: '我上一轮答过的内容' });
   const ambient = messageEvent({ sender: '@carol:example.org', body: '今天的构建报错了' });
   const mention = messageEvent({
@@ -939,13 +945,69 @@ test('the bot own room messages are neither recorded nor presented as other memb
       'the mention reaches the harness');
     const prompt = context.harness.prompts.at(-1);
     ok(prompt.includes('今天的构建报错了'), 'third-party chatter is still offered as background');
-    ok(!prompt.includes('我上一轮答过的内容'), 'the bot own echoed message is not presented as other member speech');
-    deepStrictEqual(history.search({ roomId: '!group:example.org', query: '我上一轮答过的内容' }), [],
-      'the bot own message stays out of the shared room record');
+    ok(prompt.includes('我上一轮答过的内容'), 'the bot own earlier answer is backfilled through the room-visible window');
+    ok(prompt.includes(BOT), 'the backfilled answer stays attributed to the bot itself instead of any member');
+    const ownRecord = history.search({ roomId: '!group:example.org', query: '我上一轮答过的内容' });
+    ok(ownRecord.length === 1 && ownRecord[0].kind === 'bot',
+      'the bot own message is stored under its own kind, never as human speech');
   } finally {
     await context.stop();
   }
 });
+test('plain send exits record the delivered body as text for every chunk, not the prepared chunk object', async () => {
+  const answer = `长答复开头段${'补充内容一二三四五'.repeat(60)}`;
+  const mention = messageEvent({
+    sender: '@alice:example.org',
+    body: '@bot:example.org 给个长答复',
+    content: { 'm.mentions': { user_ids: [BOT] } },
+  });
+  const directory = await makeTempDirectory('dsh-im-matrix-send-record-');
+  const history = await new MatrixRoomHistoryStore(join(directory, 'matrix-history.json')).load();
+  let placeholderProbed = false;
+  let sentCounter = 0;
+  const api = createFakeApi({
+    initial: {
+      next_batch: 's1',
+      rooms: { join: { '!group:example.org': { timeline: { events: [mention] } } } },
+    },
+    overrides: {
+      sendEvent: async (roomId, type, content) => {
+        if (!placeholderProbed) {
+          // The turn's first send is the thinking-stream placeholder; failing it once
+          // forces the bridge onto the plain delivery path the record exit is under test.
+          placeholderProbed = true;
+          throw new Error('stream initialization failed');
+        }
+        sentCounter += 1;
+        return { event_id: `$sentrec${sentCounter}:example.org` };
+      },
+    },
+  });
+  const context = await createContext({
+    roomHistory: history,
+    harness: harnessStub(answer),
+    api,
+    config: { maxMessageLength: 500 },
+  });
+  try {
+    await context.runtime.start();
+    await eventually(() => context.harness.prompts.length > 0, 'the mention reaches the harness');
+    // The thinking stream fails to open (its placeholder send throws once), so the
+    // turn falls back to plain delivery; the send-exit record is written there.
+    await eventually(() => history.search({ roomId: '!group:example.org', query: '长答复开头段' }).length === 1,
+      'the opening chunk is recorded with the delivered text');
+    await eventually(() => history.search({ roomId: '!group:example.org', query: '补充内容一二三四五' }).length >= 2,
+      'the remainder chunks are recorded too');
+    const records = history.search({ roomId: '!group:example.org', query: '补充内容一二三四五' });
+    ok(placeholderProbed, 'the stream initialization really failed and the turn was delivered plainly');
+    ok(records.every((entry) => entry.kind === 'bot' && typeof entry.text === 'string' && entry.text.length > 0),
+      'every send-exit record carries a real text body, never an empty string or a chunk object');
+    ok(new Set(records.map((entry) => entry.text)).size === records.length, 'each chunk records its own body');
+  } finally {
+    await context.stop();
+  }
+});
+
 test('a mentioned group reply is conditioned on unaddressed same-day room chatter', async () => {
   const ambient = messageEvent({ sender: '@carol:example.org', body: '今天的构建报错了' });
   const mention = messageEvent({
@@ -957,6 +1019,10 @@ test('a mentioned group reply is conditioned on unaddressed same-day room chatte
   const history = await new MatrixRoomHistoryStore(join(directory, 'matrix-history.json')).load();
   const context = await createContext({
     roomHistory: history,
+    // The legacy inline background block serves deployments that switched the
+    // whole structured chain off; with the room-visible window shipped on the
+    // structured collectors would answer this turn instead.
+    config: { visibleContextEnabled: false },
     apiOptions: {
       initial: {
         next_batch: 's1',

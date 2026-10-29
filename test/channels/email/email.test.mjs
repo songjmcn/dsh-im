@@ -2052,29 +2052,41 @@ test('a delivery that fails is retried on a later poll, not lost', async (t) => 
   // The runtime no longer marks a message seen before the bridge has run, so a
   // rejected `accept` must leave the mail eligible for the next poll instead of
   // silently consuming it.
-  const seenKeys = [];
-  const { runtime, asks } = await startDeliveryRuntime(t, {
-    mailbox: async () => [inboundMail(1)],
-    onHarnessAsk: () => { seenKeys.push(1); },
+  let polls = 0;
+  const { runtime, asks, state } = await startDeliveryRuntime(t, {
+    mailbox: async () => { polls += 1; return [inboundMail(1)]; },
   });
   await runtime.start();
   const bridge = runtime.bridge;
-  let rejectFirst = true;
+  let attempts = 0;
+  const retried = Promise.withResolvers();
   const accept = bridge.accept.bind(bridge);
-  bridge.accept = (message, options) => {
-    if (rejectFirst) {
-      rejectFirst = false;
-      return Promise.reject(new Error('queue unavailable'));
+  t.mock.method(bridge, 'accept', async (message, options) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('queue unavailable');
+    try {
+      await accept(message, options);
+      retried.resolve();
+    } catch (error) {
+      retried.reject(error);
+      throw error;
     }
-    return accept(message, options);
-  };
+  });
 
-  await waitFor(
-    () => asks.length > 0,
-    () => 'the retry never ran after the first delivery was rejected',
-  );
+  // Await the completed delivery, not a two-second race against CI disk load.
+  // The watchdog also keeps the event loop alive: the poll timer is unref'd.
+  const watchdog = setTimeout(() => retried.reject(new Error(
+    `the retry did not complete (${polls} polls, ${attempts} delivery attempts)`,
+  )), 10_000);
+  try {
+    await retried.promise;
+  } finally {
+    clearTimeout(watchdog);
+  }
+  assert.ok(polls >= 2, 'the retry happens on a later poll');
+  assert.equal(attempts, 2, 'one rejected delivery is followed by one retry');
   assert.equal(asks.length, 1, 'the retry runs the turn exactly once');
-  assert.equal(seenKeys.length, 1);
+  assert.equal(state.hasSeen('<rfc-1@x>'), true, 'the successful retry is recorded as handled');
 });
 
 // ── first bind against a real workspace store ──────────────────────────────

@@ -35,18 +35,21 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
   defineCatalogCommand('history', '查看最近历史消息（仅私聊）', [
     '/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）',
   ], { privateOnly: true }),
-  defineCatalogCommand('workspace', '切换工作区', [
+  // Merged listing+switch command: no argument opens the picker, an argument
+  // switches directly. /wsl and friends stay accepted but leave the menu so
+  // there is one workspace entry to choose from.
+  defineCatalogCommand('workspace', '查看或切换工作区', [
+    '/workspace 或 /ws  查看可切换的工作区（点按钮切换）',
     '/workspace 工作区序号或绝对路径  切换工作区',
-  ], { aliases: ['ws'] }),
+  ], { aliases: [{ name: 'ws', menuVisible: false }] }),
   defineCatalogCommand('conv', '设置当前对话专属工作区', [
     '/conv 或 /conversation  查看当前对话工作区',
     '/conv 工作区绝对路径或序号  设置当前对话专属工作区',
     '/conv clear  清除专属工作区，回到 bot 默认工作区',
   ], { aliases: ['conversation', 'thread'] }),
   defineCatalogCommand('workspacelist', '列出工作区绝对路径', [
-    '/workspacelist  列出工作区绝对路径',
-    '/ws、/wsl、/workspaces  工作区命令别名',
-  ], { aliases: ['workspaces', 'wsl'] }),
+    '/workspacelist、/wsl、/workspaces  工作区列表别名（等同 /ws）',
+  ], { aliases: ['workspaces', 'wsl'], menuVisible: false }),
   defineCatalogCommand('sessionlist', '列出会话 ID 和标题', [
     '/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题',
     '/sessionlist --limit N  仅列出当前工作区前 N 个会话',

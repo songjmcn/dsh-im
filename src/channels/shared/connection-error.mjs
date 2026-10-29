@@ -1,13 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import packageInfo from '../../../package.json' with { type: 'json' };
-import { normalizeDiagnosticDetails } from './diagnostic-details.mjs';
+import { DIAGNOSTIC_ERROR_TYPES, normalizeDiagnosticDetails } from './diagnostic-details.mjs';
 import { t } from './i18n.mjs';
 
 const reported = new WeakMap();
 const lastReport = new WeakMap();
 const stages = new WeakMap();
-const OWNED_REASONS = { 'connect-timeout': 'timeout', 'telegram-timeout': 'timeout', 'cli-timeout': 'timeout', 'provider-timeout': 'timeout', 'telegram-response-invalid': 'invalid-response', 'office-protocol-mismatch': 'invalid-response' };
-const STANDARD_NAMES = new Set(['Error', 'TypeError', 'SyntaxError', 'AggregateError', 'DOMException', 'AxiosError', 'TimeoutError', 'AbortError']);
+const OWNED_REASONS = { 'harness-interaction-timeout': 'timeout', 'harness-response-invalid': 'invalid-response', 'connect-timeout': 'timeout', 'telegram-timeout': 'timeout', 'cli-timeout': 'timeout', 'provider-timeout': 'timeout', 'telegram-response-invalid': 'invalid-response', 'office-protocol-mismatch': 'invalid-response' };
 const KNOWN_MESSAGES = {
   'discord-401': 'Discord Bot Token 无效，请重新填写。',
   'discord-intents': 'Discord Gateway Intents 配置不正确，请检查 Developer Portal 的 Bot 设置。',
@@ -36,7 +35,7 @@ export function connectionErrorChain(error) {
 export function extractConnectionEvidence(error) {
   const { chain, truncated } = connectionErrorChain(error);
   const errors = chain.map(e => ({
-    type: STANDARD_NAMES.has(e.name) ? e.name : 'Error',
+    type: DIAGNOSTIC_ERROR_TYPES.has(e.name) ? e.name : 'Error',
     // Host RPC adapters carry safe diagnostic facts without the original Error graph.
     ...normalizeDiagnosticDetails({
       reason: e.details?.reason, reasons: e.details?.reasons,
@@ -54,18 +53,43 @@ export function extractConnectionEvidence(error) {
   const allReasons = [...new Set(errors.flatMap(e => e.reason === 'multiple-causes' ? e.reasons ?? [] : [e.reason]).filter(r => r && !['unknown', 'multiple-causes'].includes(r)))];
   const precise = allReasons.filter(r => !['timeout', 'http-error', 'provider-rejected', 'invalid-response'].includes(r));
   const reasons = precise.length ? precise : allReasons;
-  const first = field => chain.map(e => normalizeDiagnosticDetails({ [field]: e[field] ?? e.details?.[field] })[field]).find(v => v !== undefined);
+  const first = field => chain.map(e => normalizeDiagnosticDetails({ [field]: stages.get(e)?.[field] ?? e[field] ?? e.details?.[field] })[field]).find(v => v !== undefined);
+  const correlation = {};
+  for (const field of ['sessionId', 'promptRpcId']) {
+    // Only locally attached identifiers belong in logs, never arbitrary RPC details.
+    const value = chain.map(e => stages.get(e)?.[field]).find(v => v !== undefined);
+    if (typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/u.test(value)) correlation[field] = value;
+  }
   return {
-    chain, errors,
+    chain, errors, correlation,
     details: normalizeDiagnosticDetails({
       reason: reasons.length > 1 ? 'multiple-causes' : reasons[0] ?? 'unknown',
       ...(reasons.length > 1 ? { reasons } : {}),
       httpStatus: errors.find(e => e.httpStatus !== undefined)?.httpStatus,
       providerCode: errors.find(e => e.providerCode !== undefined)?.providerCode,
       method: first('method'), transport: first('transport'),
+      stage: first('stage'), submissionState: first('submissionState'),
+      attempts: first('attempts'), lastFailureReason: first('lastFailureReason'),
       durationMs: first('durationMs'), timeoutMs: first('timeoutMs'), host: first('host'), truncated,
     }),
   };
+}
+
+/** Keep request context off shared errors (for example a rejected model-catalog promise).
+ * Preserve the original prototype, properties and cause for existing business handlers. */
+export function messageDiagnosticError(cause, context) {
+  if (cause?.name === 'AbortError') return cause;
+  const source = cause && typeof cause === 'object' ? cause : new Error('Message processing failed');
+  const error = source instanceof DOMException
+    ? Object.defineProperties(new DOMException(source.message, source.name), Object.getOwnPropertyDescriptors(source))
+    : Object.defineProperties(Object.setPrototypeOf(source instanceof Error ? new Error() : {}, Object.getPrototypeOf(source)),
+      Object.getOwnPropertyDescriptors(source));
+  stages.set(error, { ...context, ...stages.get(source) });
+  return error;
+}
+
+export function runtimeDiagnosticDetails() {
+  return { pluginVersion: packageInfo.version, nodeVersion: process.versions.node, platform: process.platform };
 }
 
 export async function atConnectionStage(stage, operation, resource) {
@@ -73,9 +97,9 @@ export async function atConnectionStage(stage, operation, resource) {
   catch (error) { throw connectionStageError(error, stage, resource); }
 }
 
-export function connectionStageError(cause, stage, resource) {
+export function connectionStageError(cause, stage, resource, details = {}) {
   if (!cause || typeof cause !== 'object') cause = new Error('Operation failed');
-  if (!stages.has(cause)) stages.set(cause, normalizeDiagnosticDetails({ stage, resource }));
+  if (!stages.has(cause)) stages.set(cause, normalizeDiagnosticDetails({ ...details, stage, resource }));
   return cause;
 }
 
@@ -92,6 +116,7 @@ export function diagnosticRpcResult(diagnostics, cause, result, context) {
 }
 
 export function connectionHint(details) {
+  if (details.stage === 'qr.encode') return t('本机二维码图片生成失败，请重试；若持续失败，请复制诊断信息并检查 DSH 运行环境。');
   const r = details.reason;
   if (r === 'multiple-causes') return t('检测到多个底层原因，请展开诊断详情逐项检查。');
   if (['ENOTFOUND', 'EAI_AGAIN'].includes(r)) return t('服务域名解析失败，请检查运行 DSH 的机器的 DNS 和网络设置。');
@@ -145,7 +170,7 @@ export function createConnectionDiagnostics({ channel, logger = console, now = D
     const details = normalizeDiagnosticDetails({
       ...evidence.details, ...context, ...safe.details, ...described.details, ...owned,
       channel, stage: owned.stage ?? described.details?.stage ?? safe.details?.stage ?? context.stage ?? operationStage(context.operation),
-      pluginVersion: packageInfo.version, nodeVersion: process.versions.node, platform: process.platform,
+      ...runtimeDiagnosticDetails(),
     });
     const code = safe.code ?? context.code ?? `${channel}-operation-failed`;
     const hint = described.hint ?? safe.hint ?? safe.details?.hint ?? connectionHint(details);

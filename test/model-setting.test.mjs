@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { HarnessClient } from '../src/channels/shared/harness-client.mjs';
 
 import {
   EMPTY_MODEL_CATALOG,
@@ -183,6 +184,46 @@ test('workspace-aware model setting refreshes the catalog and rejects unavailabl
   const cleared = await controller.updateModel('bot_one', null);
   assert.equal(cleared.bots[0].model, null);
   assert.deepEqual(cleared.modelCatalog, catalog);
+});
+
+test('saving model settings bypasses the shared catalog cache and reuses the fresh response', async (t) => {
+  const { path, workspace } = await fixture(t);
+  const workspaces = await new BotWorkspaceStore(path, { defaultWorkspace: workspace }).load();
+  await workspaces.ensure('bot_one');
+  let catalog = structuredClone(CATALOG);
+  let reads = 0;
+  const success = (rpcId, value) => ({ rpcId, result: { ok: true, value } });
+  const harness = new HarnessClient({ workspace, apiProxy: {
+    host: { describe: ({ rpcId }) => success(rpcId, {}) },
+    llm: { models: ({ rpcId, payload }) => {
+      assert.deepEqual(payload, {});
+      reads += 1;
+      return success(rpcId, structuredClone(catalog));
+    } },
+  } });
+  const controller = createWorkspaceAwareController({
+    status() { return { bots: [{ botId: 'bot_one' }] }; },
+  }, {
+    workspaces, stateFor: async () => ({}),
+    modelCatalog: (options) => listModelCatalog(harness, options),
+  });
+  await controller.status();
+  await controller.status();
+  assert.equal(reads, 1);
+  catalog.groups[0].models[0].reasoning.efforts = [{ id: 'off', name: 'Off' }];
+  await assert.rejects(controller.updateModel('bot_one', REASONING_MODEL), { code: 'model-reasoning-unavailable' });
+  assert.equal(workspaces.modelFor('bot_one'), null);
+  assert.equal(reads, 2);
+  catalog.groups[0].models = [];
+  await assert.rejects(controller.updateModel('bot_one', MODEL), { code: 'model-selection-unavailable' });
+  assert.equal(workspaces.modelFor('bot_one'), null);
+  catalog.groups[0].models = [{ id: 'new-model', name: 'New model' }];
+  const newModel = { provider: 'openai', model: 'new-model' };
+  const before = reads;
+  const saved = await controller.updateModel('bot_one', newModel);
+  assert.deepEqual(workspaces.modelFor('bot_one'), newModel);
+  assert.deepEqual(saved.modelCatalog, catalog);
+  assert.equal(reads, before + 1, 'the save response reuses the validation read');
 });
 
 test('shared model RPC payload accepts only the exact bot.model.set contract', () => {

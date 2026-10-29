@@ -1,11 +1,16 @@
 import { harnessQuestionText } from '../shared/harness-question.mjs';
+import { t } from '../shared/i18n.mjs';
 import { TextHarnessBridge, createTextBridgeStatus } from '../shared/text-harness-bridge.mjs';
+import { workspaceLabels } from '../shared/workspace-labels.mjs';
 
 export const TELEGRAM_DESCRIPTOR = Object.freeze({
   key: 'telegram',
   label: 'Telegram',
   connectionLabel: ' Bot API 长轮询',
-  reactions: Object.freeze({ processing: '👀', success: '👍', error: '👎' }),
+  // A finished turn leaves no reaction behind: Telegram keeps offering reaction
+  // controls on a message that carries one, which repeats for the reader even
+  // with reaction notifications off. A failure still keeps its mark.
+  reactions: Object.freeze({ processing: '👀', success: null, error: '👎' }),
 });
 
 /** One keyboard row per option; beyond this the list stops being scannable. */
@@ -68,11 +73,67 @@ export const TELEGRAM_INTERACTION_CARD = Object.freeze({
   parse: parseTelegramCardCallback,
 });
 
+/**
+ * One keyboard row per workspace. Rows stack with no pagination: beyond this
+ * the phone view becomes a wall of buttons, so the bridge falls back to the
+ * text list that already answers `/ws <index>` (explicit degradation).
+ */
+const MAX_WORKSPACE_BUTTONS = 20;
+
+/**
+ * Encode one workspace button. The path cannot ride in `callback_data` (64-byte
+ * budget), so the press carries a presentation nonce plus the index into the
+ * snapshot the bridge cached when it sent the card. A stale card therefore
+ * cannot switch to a workspace that a fresher list no longer contains.
+ */
+function workspaceCardCallbackData(nonce, index) {
+  // Versioned namespace (upstream convention, cf. openclaw tga1:/tgq1:): a future
+  // payload change can tell an old card apart instead of mis-parsing it.
+  return `w1|${nonce}|${index}`;
+}
+
+/** Parse a press produced by {@link workspaceCardCallbackData}; null for foreign payloads. */
+export function parseTelegramWorkspaceCallback(data) {
+  const match = typeof data === 'string'
+    ? /^w1\|([A-Za-z0-9_-]{1,16})\|(\d{1,3})$/u.exec(data)
+    : null;
+  if (!match) return null;
+  return { nonce: match[1], index: Number(match[2]) };
+}
+
+/**
+ * Inline-keyboard presentation for the merged `/ws` listing.
+ *
+ * The card text is deliberately state-free: after a press only the keyboard is
+ * replaced (`editMessageReplyMarkup`), so a "current: …" sentence in the body
+ * would immediately lie about which workspace is current.
+ */
+export const TELEGRAM_WORKSPACE_CARD = Object.freeze({
+  render(listing, { nonce } = {}) {
+    if (typeof nonce !== 'string' || !nonce) return null;
+    const paths = Array.isArray(listing?.paths) ? listing.paths : [];
+    if (paths.length === 0 || paths.length > MAX_WORKSPACE_BUTTONS) return null;
+    const current = typeof listing?.current === 'string' ? listing.current : null;
+    const labels = workspaceLabels(paths, listing?.titles ?? {});
+    return {
+      text: t('选择要切换的工作区（共 {count} 个）：', { count: paths.length }),
+      markup: {
+        inline_keyboard: paths.map((path, index) => [{
+          text: `${path === current ? '✓ ' : ''}${index + 1}. ${labels[index].label}`,
+          callback_data: workspaceCardCallbackData(nonce, index),
+        }]),
+      },
+    };
+  },
+  parse: parseTelegramWorkspaceCallback,
+});
+
 export class TelegramHarnessBridge extends TextHarnessBridge {
   constructor(options) {
     super({
       descriptor: TELEGRAM_DESCRIPTOR,
       interactionCard: TELEGRAM_INTERACTION_CARD,
+      workspaceCard: TELEGRAM_WORKSPACE_CARD,
       ...options,
     });
   }

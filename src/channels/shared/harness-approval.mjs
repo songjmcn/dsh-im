@@ -134,6 +134,25 @@ export class HarnessApprovalQueue {
     return this.#routes.get(key)?.items.some((pending) => !pending.inactive) === true;
   }
 
+  /**
+   * Reject the active approvals of one route: the sender moved on to a new
+   * addressed request instead of deciding the tool call, and the conversation
+   * must not wait behind a decision that is not coming.
+   * @param {string} key The route key.
+   * @returns {Promise<number>} How many approvals were rejected.
+   */
+  async rejectRoute(key) {
+    const route = this.#routes.get(key);
+    if (!route) return 0;
+    let rejected = 0;
+    for (const pending of [...route.items]) {
+      if (pending.inactive || pending.resolving) continue;
+      await this.#submit(pending, 'rejected').catch(() => undefined);
+      rejected += 1;
+    }
+    return rejected;
+  }
+
   claimReply({
     key,
     actor,

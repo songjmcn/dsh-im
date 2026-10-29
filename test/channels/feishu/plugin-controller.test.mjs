@@ -84,6 +84,7 @@ test('QR success stores the secret off-config and becomes immediately chat-ready
   assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:message.p2p_msg:readonly'));
   assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:message.group_at_msg.include_bot:readonly'));
   assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:message:readonly'));
+  assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:message.group_msg'));
   assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:message:send_as_bot'));
   assert.ok(fx.getSdkOptions().addons.scopes.tenant.includes('im:resource'));
   assert.equal(fx.getSdkOptions().addons.scopes.tenant.includes('im:resource:upload'), false);
@@ -106,6 +107,8 @@ test('QR success stores the secret off-config and becomes immediately chat-ready
   assert.equal(status.bot.name, '北汇星河助手');
   assert.equal(fx.getSecret(), 'new-secret');
   assert.equal(fx.getConfig().appSecret, undefined);
+  assert.equal(fx.getConfig().groupMessagePermissionGranted, true);
+  assert.equal(fx.getConfig().groupResponseMode ?? 'mention', 'mention');
   assert.doesNotMatch(JSON.stringify(status), /new-secret|client_secret/);
 });
 

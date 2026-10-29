@@ -201,6 +201,21 @@ const targets = await ctx.dshIm.listTargets(botId);
 // [{ targetId, name?, kind, route }, ...]
 ```
 
+同 Host 插件也可以把已知的会话路由注册成投递目标。注册后该 `targetId` 可直接用于 `send`，并出现在设置页的目标列表里。下面以飞书私聊为例，`botId` 必须属于飞书机器人：
+
+```js
+await ctx.dshIm.createTarget(botId, {
+  targetId: 'release-alerts',
+  kind: 'user',
+  route: { openId: 'ou_xxx' },
+  name: '发布提醒',              // 可选
+});
+```
+
+`kind` 和 `route` 必须匹配机器人的渠道，参见[九渠道手动填写字段](#九渠道手动填写字段)。例如飞书群聊使用 `kind: 'group'` 和 `route: { chatId: 'oc_xxx' }`；Telegram 私聊或群聊使用 `kind: 'chat'` 和 `route: { chatId: '123456789' }`，Chat ID 必须是十进制字符串。
+
+`targetId` 已存在时以 `target-conflict` 拒绝；修改或删除已有目标仍走管理 RPC 的 `target.update` / `target.delete`。
+
 同 Host 插件可以通过同一个服务发现已配置机器人：
 
 ```js

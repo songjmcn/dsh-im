@@ -319,33 +319,15 @@ test('the general settings gear sits to the right of GitHub and outside the chan
   assert.doesNotMatch(markup, /id="dim-panel-global-settings"/);
 });
 
-test('the general settings page uses an Attachments tab with contextual help and an explicit save button', () => {
-  const markup = renderToStaticMarkup(React.createElement(GlobalSettingsPanel, {
-    rpcCall: async () => ({ ok: true, value: { ttlHours: 24 } }),
-  }));
-
-  assert.match(markup, /aria-label="通用设置"/);
+test('general settings defaults to group history and keeps a separate Attachments tab', () => {
+  const markup = renderToStaticMarkup(React.createElement(GlobalSettingsPanel, { rpcCall: async () => ({}) }));
   assert.match(markup, /<h2>通用设置<\/h2>/);
-  assert.match(markup, /role="tablist" aria-label="通用设置分类"/);
-  assert.match(markup, /id="dim-general-settings-tab-attachments"[^>]*role="tab"[^>]*aria-selected="true"[^>]*>附件<\/button>/);
-  assert.match(markup, /id="dim-general-settings-panel-attachments"[^>]*role="tabpanel"[^>]*aria-labelledby="dim-general-settings-tab-attachments"/);
-  assert.equal((markup.match(/role="tab"/g) ?? []).length, 1);
-  // No label wrapper: the input takes its accessible name from the heading.
-  assert.doesNotMatch(markup, /<label[^>]*>[^<]*<input[^>]*id="dim-globalTtlInput"/);
-  assert.match(markup, /<input[^>]*aria-labelledby="dim-globalTtlTitle"/);
-  assert.match(markup, /aria-label="查看附件保留时长说明"/);
-  assert.match(markup, /class="dim-globalTtlTooltip" role="tooltip"/);
-  assert.match(markup, /<code>1~8760<\/code>/);
-  assert.match(markup, /正在读取通用设置…/);
-  // Field actions share one row; the heading stays dedicated to its label and help.
-  const ttlFormMarkup = markup.match(/<form class="dim-globalTtlRow"[^]*?<\/form>/)?.[0] ?? '';
-  assert.doesNotMatch(markup, /dim-globalHeadActions/);
-  assert.match(ttlFormMarkup, />清理过期附件<\/button>/);
-  assert.ok(ttlFormMarkup.indexOf('保存') < ttlFormMarkup.indexOf('清理过期附件'));
-  assert.match(ttlFormMarkup, /aria-haspopup="dialog"/);
-  assert.match(ttlFormMarkup, /aria-expanded="false"/);
-  assert.doesNotMatch(ttlFormMarkup, /role="alertdialog"|>确认清理<\/button>/);
-  assert.match(markup, /<button[^>]*type="submit"[^>]*disabled=""[^>]*data-kind="primary"[^>]*>保存<\/button>/);
+  assert.match(markup, /id="dim-general-settings-tab-general"[^>]*aria-selected="true"/);
+  assert.match(markup, /id="dim-general-settings-tab-attachments"[^>]*aria-selected="false"/);
+  assert.equal((markup.match(/role="tab"/g) ?? []).length, 2);
+  assert.match(markup, /群聊天记录保留天数/);
+  assert.match(markup, /value="14"/);
+  assert.match(markup, /正在读取群记录设置/);
 });
 
 test('the sweep action opens a separate confirmation popover and supports cancel', async () => {
@@ -362,6 +344,10 @@ test('the sweep action opens a separate confirmation popover and supports cancel
   let renderer;
   await act(async () => {
     renderer = create(React.createElement(GlobalSettingsPanel, { rpcCall }));
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    findButton(renderer, '附件').props.onClick();
     await flushMicrotasks();
   });
 
@@ -417,6 +403,10 @@ test('the TTL input saves explicitly, preserves invalid text for correction, and
   let renderer;
   await act(async () => {
     renderer = create(React.createElement(GlobalSettingsPanel, { rpcCall }));
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    findButton(renderer, '附件').props.onClick();
     await flushMicrotasks();
   });
   const input = () => renderer.root.findByProps({ id: 'dim-globalTtlInput' });
@@ -486,6 +476,10 @@ test('a failed explicit save keeps the input enabled with the error inline', asy
   let renderer;
   await act(async () => {
     renderer = create(React.createElement(GlobalSettingsPanel, { rpcCall }));
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    findButton(renderer, '附件').props.onClick();
     await flushMicrotasks();
   });
   const input = () => renderer.root.findByProps({ id: 'dim-globalTtlInput' });
@@ -1220,15 +1214,27 @@ test('the bundled DingTalk channel has no local sender approval workflow', async
   );
 });
 
-test('the bilingual dictionary has no duplicate object keys', async () => {
-  const source = await readFile(new URL('../plugin-src/client/i18n.js', import.meta.url), 'utf8');
-  const { warnings } = await transform(source, { loader: 'js', logLevel: 'silent' });
-  assert.deepEqual(warnings.filter((warning) => warning.id === 'duplicate-object-key'), []);
+test('the client dictionaries have no duplicate object keys', async () => {
+  // A duplicate Chinese key silently drops one of the two translations, which no
+  // parity check can catch: the object only ever holds the later value.
+  for (const name of ['i18n.js', 'i18n-ru.js']) {
+    const source = await readFile(new URL(`../plugin-src/client/${name}`, import.meta.url), 'utf8');
+    const { warnings } = await transform(source, { loader: 'js', logLevel: 'silent' });
+    assert.deepEqual(
+      warnings.filter((warning) => warning.id === 'duplicate-object-key'),
+      [],
+      name,
+    );
+  }
 });
 
 test('every shipped Chinese client string has an English projection', async () => {
+  // Dictionary modules are the projection rather than a source of UI strings:
+  // their Chinese keys are the very literals the other modules render, so
+  // scanning them would ask the dictionaries to translate themselves.
+  const dictionaries = new Set(['i18n.js', 'i18n-ru.js']);
   const paths = (await readdir(CLIENT_SOURCE_DIRECTORY_URL, { recursive: true }))
-    .filter((path) => path.endsWith('.js') && path !== 'i18n.js');
+    .filter((path) => path.endsWith('.js') && !dictionaries.has(path));
   const sources = await Promise.all(paths.map((path) =>
     readFile(new URL(path, CLIENT_SOURCE_DIRECTORY_URL), 'utf8')));
   const strings = new Set();
@@ -1484,9 +1490,8 @@ test('all nine channel settings and connected cards render English copy', () => 
     }));
     assert.match(globalMarkup, /General settings/);
     assert.match(globalMarkup, />Attachments<\/button>/);
-    assert.match(globalMarkup, /Attachment retention \(hours\)/);
-    assert.match(globalMarkup, /Clean up expired attachments/);
-    assert.match(globalMarkup, /Loading general settings…/);
+    assert.match(globalMarkup, /Group chat retention \(days\)/);
+    assert.match(globalMarkup, /Loading group history settings…/);
     assert.doesNotMatch(globalMarkup, /[\p{Script=Han}]/u);
 
     const pages = [

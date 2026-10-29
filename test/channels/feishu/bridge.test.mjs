@@ -5485,7 +5485,7 @@ test('bridge does not expose internal error details in a Feishu failure reply', 
   await bridge.waitForIdle();
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /任务未完成，暂时无法确定原因/);
+  assert.match(sent[0], /任务结果尚未确认.*不要立即重复提交/);
   assert.match(sent[0], /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(sent[0], /secret-shaped-internal-detail|private\/path/);
   assert.equal(status.lastError, status.lastMessageError.message);
@@ -5493,6 +5493,8 @@ test('bridge does not expose internal error details in a Feishu failure reply', 
   const diagnostic = logs.find(([label]) => label.includes(status.lastMessageError.referenceId))?.[1];
   assert.equal(diagnostic?.code, 'INTERNAL_UNKNOWN');
   assert.equal(diagnostic?.referenceId, status.lastMessageError.referenceId);
+  assert.equal(diagnostic?.details.submissionState, 'unknown');
+  assert.equal(diagnostic?.sessionId, 'session-existing');
   assert.ok(Array.isArray(diagnostic?.errors));
   assert.doesNotMatch(JSON.stringify(logs), /secret-shaped-internal-detail|private\/path/);
 });
@@ -6451,11 +6453,23 @@ test('workspace titles flow through both cards, refreshes, and path-based dropdo
   await bridge.waitForIdle();
   assert.deepEqual(selected, [paths[1]]);
   assert.equal(picker(JSON.parse(patches.at(-1).data.content)).options[0].text.content, '✓ 交流区');
-  assert.ok(sent.some((item) => item.msgType === 'text' && item.content.includes(paths[1])));
+  assert.ok(sent.some((item) => item.msgType === 'text'
+    && JSON.parse(item.content).text === `工作区已切换为：${paths[1]}`));
 
   await send('/workspacelist');
   const list = buttonsFromCard(sent.at(-1).content).filter((button) => callbackAction(button).startsWith('workspace:'));
   assert.deepEqual(list.map((button) => button.text.content), ['1. 交流区（当前）', '2. 策略研究']);
+  // Merged command: the bare /workspace and /ws open the same picker card.
+  for (const alias of ['/ws', '/workspace']) {
+    await send(alias);
+    const aliased = buttonsFromCard(sent.at(-1).content)
+      .filter((button) => callbackAction(button).startsWith('workspace:'));
+    assert.deepEqual(
+      aliased.map((button) => button.text.content),
+      ['1. 交流区（当前）', '2. 策略研究'],
+      alias,
+    );
+  }
   await send('2');
   assert.deepEqual(selected, [paths[1], paths[0]]);
 
@@ -13533,5 +13547,48 @@ for (const scenario of ['final rewrite', 'shrink and regrow', 'unchanged draft']
     for (let n = 0; n < 6; n++) assert.equal(delivered.join('\n').split(`### FINAL_T${n}`).length - 1, 1);
     assert.match(delivered.at(-1), /_已完成_/);
     assert.deepEqual(fx.text, []);
+  });
+}
+
+for (const mode of ['text', 'stream', 'fallback']) {
+  test(`corrupt Session recovery sends a Feishu notice before the answer (${mode})`, async () => {
+    const fixture = stateFixture([['p2p:ou_user', 'corrupt-session']]);
+    const sent = [];
+    let created = 0;
+    const status = bridgeStatus();
+    const bridge = new FeishuHarnessBridge({
+      client: textClient(message => sent.push(message.text)),
+      ...(mode === 'text' ? {} : { channel: { stream: async (_chatId, input) => {
+        if (mode === 'fallback') throw new Error('stream unavailable');
+        await input.markdown({ setContent: async text => sent.push(text) });
+        return { messageId: 'om_stream' };
+      } } }),
+      state: fixture.state, status,
+      allowedSenderOpenIds: new Set(['ou_user']),
+      harness: {
+        ensureRunning: async () => {},
+        sessionExists: async id => {
+          if (id === 'corrupt-session') throw Object.assign(new Error('unreadable'), { code: 'session-unreadable' });
+          return true;
+        },
+        createSession: async () => { created++; return 'replacement-session'; },
+        ask: async (id, text) => {
+          assert.equal(id, 'replacement-session');
+          assert.equal(text, 'recovery test');
+          assert.equal(sent.length, 1);
+          assert.match(sent[0], /日志已损坏.*新会话/u);
+          return 'RECOVERY_OK';
+        },
+      },
+      logger: { warn() {} },
+    });
+    bridge.accept(event(`om_corrupt_${mode}`, 'recovery test'));
+    await bridge.waitForIdle();
+    assert.equal(created, 1);
+    assert.equal(fixture.sessions.get('p2p:ou_user'), 'replacement-session');
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1], 'RECOVERY_OK');
+    assert.equal(status.messagesReplied, 1);
+    assert.equal(status.lastError, null);
   });
 }

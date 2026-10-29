@@ -201,7 +201,7 @@ test('HarnessClient rejects malformed model and run-state responses', async () =
   responses.set('session.selectModel', { selected: { provider: '', model: 'bad' } });
   await assert.rejects(
     client.selectSessionModel('session-one', { provider: 'p', model: 'm' }),
-    /invalid response for session\.selectModel/,
+    { code: 'harness-response-invalid', method: 'session.selectModel' },
   );
 
   await assert.rejects(

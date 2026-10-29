@@ -1,12 +1,14 @@
+import { isSessionNotFound } from './session-error.mjs';
 import { createDeferredDeliveryRegistry, extractCompletedTurnAnswer } from './deferred-delivery.mjs';
 import { t } from './i18n.mjs';
 import { channelDeliveryFailure } from './message-failure.mjs';
+import { PromptFailureTracker } from './prompt-failure-tracker.mjs';
 
 export function deferredOutcomeText(outcome) {
   if (outcome.found && outcome.text) return outcome.text;
   const reason = outcome.reason === 'stopped' ? t('已停止')
     : ['aborted', 'cancelled'].includes(outcome.reason) ? t('已中止')
-      : outcome.reason === 'failed' ? t('任务失败') : t('已结束');
+      : ['failed', 'error'].includes(outcome.reason) ? t('任务失败') : t('已结束');
   return t('后台任务已结束（{reason}），没有可推送的最终结果。', { reason });
 }
 
@@ -83,7 +85,10 @@ export function createDeferredDeliveryCoordinator({
       const ordered = [...events.values()].sort((a, b) => a.seq - b.seq);
       if (targetTurn === null && entry.promptRpcId) {
         let openTurn = null;
+        const earlyFailure = new PromptFailureTracker(entry.promptRpcId, entry.afterSeq);
         for (const event of ordered) {
+          const failedTurn = earlyFailure.consume(event);
+          if (failedTurn !== null) { targetTurn = failedTurn; break; }
           if (event.type === 'turn/start') openTurn = event.data?.turn ?? null;
           if (event.type === 'user/message' && event.data?.source?.rpcId === entry.promptRpcId) {
             targetTurn = Number.isSafeInteger(event.data?.turn) ? event.data.turn : openTurn;
@@ -155,7 +160,7 @@ export function createDeferredDeliveryCoordinator({
       return 'delivered';
     } catch (error) {
       if (activeSignal.aborted) return 'none';
-      if (error?.code === 'session-not-found') { await remove(entry); return 'none'; }
+      if (isSessionNotFound(error?.code)) { await remove(entry); return 'none'; }
       const current = await pending(id);
       if (!current) return 'none';
       if (!sending) {

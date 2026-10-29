@@ -546,16 +546,6 @@ test('Telegram document errors retain provider details and use stable artifact r
     status: 400,
     code: 'artifact-too-large',
   }, {
-    body: {
-      ok: false,
-      error_code: 429,
-      description: 'Too Many Requests',
-      parameters: { retry_after: 7 },
-    },
-    status: 429,
-    code: 'artifact-rate-limited',
-    retryAfter: 7,
-  }, {
     body: { ok: false, error_code: 400, description: 'Bad Request: unsupported document' },
     status: 400,
     code: 'artifact-provider-rejected',
@@ -582,6 +572,39 @@ test('Telegram document errors retain provider details and use stable artifact r
       return true;
     });
   }
+});
+
+test('a rate-limited document send is retried and then reported as channel-rate-limit', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let attempts = 0;
+  const api = new TelegramApi({
+    token: TOKEN,
+    fetchImpl: async () => {
+      attempts += 1;
+      return jsonResponse({
+        ok: false,
+        error_code: 429,
+        description: 'Too Many Requests',
+        parameters: { retry_after: 7 },
+      }, 429);
+    },
+  });
+  const delivery = api.sendDocument({
+    chatId: 123,
+    file: { fileName: 'result.bin', bytes: Buffer.from('result') },
+  }).then(() => null, (error) => error);
+  for (let waited = 0; waited < 3; waited += 1) {
+    await new Promise((resolve) => { setImmediate(resolve); });
+    t.mock.timers.tick(7_000);
+    await new Promise((resolve) => { setImmediate(resolve); });
+  }
+  const error = await delivery;
+  assert.equal(attempts, 4, 'one original call and three retries');
+  assert.equal(error.code, 'channel-rate-limit');
+  assert.equal(error.providerCode, 429);
+  assert.equal(error.status, 429);
+  assert.equal(error.retry_after, 7);
+  assert.equal(error.retryAfter, 7);
 });
 
 test('Telegram document delivery marks post-dispatch failures uncertain but preserves caller aborts', async () => {
@@ -2119,6 +2142,7 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
   const drafts = [];
   const edits = [];
   const sent = [];
+  const deleted = [];
   const acknowledgements = [];
   const keyboardEdits = [];
   let answerUpdateDelivered = false;
@@ -2169,9 +2193,16 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
     sendRichMessageDraft: async (payload) => { drafts.push(payload); return true; },
     editMessageText: async (payload) => {
       edits.push(payload);
-      if (payload.richMessage?.markdown === '已选择生产环境') finalReplySent.resolve();
       return true;
     },
+    sendRichMessage: async ({ richMessage }) => {
+      const messageId = nextOutboundMessageId;
+      nextOutboundMessageId += 1;
+      sent.push({ text: richMessage.markdown });
+      if (richMessage.markdown === '已选择生产环境') finalReplySent.resolve();
+      return { message_id: messageId };
+    },
+    deleteMessage: async ({ messageId }) => { deleted.push(messageId); return true; },
     sendMessage: async ({ text, replyMarkup }) => {
       const messageId = nextOutboundMessageId;
       nextOutboundMessageId += 1;
@@ -2283,10 +2314,10 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
     assert.equal(state.hasSeen('11'), true);
     assert.equal(sent[0].text, '正在处理…');
     releaseTurn.resolve();
-    await bounded(finalReplySent.promise, 'the placeholder was not finalized after the answer');
+    await bounded(finalReplySent.promise, 'the answer was not sent as a new message');
     assert.equal(drafts.length, 0);
-    assert.equal(edits.length, 1);
-    assert.equal(edits[0].messageId, 900);
+    assert.equal(edits.length, 0, 'the answer never rewrites the placeholder');
+    assert.deepEqual(deleted, [900], 'the finished turn drops its placeholder');
   } finally {
     releaseTurn.resolve();
     await runtime.stop();
@@ -2305,6 +2336,7 @@ test('Telegram private placeholder streams keep controls responsive and ordinary
       const controls = [];
       const sent = [];
       const edits = [];
+      const deleted = [];
       const drafts = [];
       let promptControl;
       let running = false;
@@ -2315,7 +2347,7 @@ test('Telegram private placeholder streams keep controls responsive and ordinary
           if (asked.length > 1) return 'follow-up answer';
           promptControl = options.control;
           running = true;
-          await options.onUpdate({ type: 'text', text: 'partial answer' });
+          await options.onUpdate({ type: 'tool', name: 'bash' });
           started.resolve();
           try {
             await release.promise;
@@ -2343,7 +2375,12 @@ test('Telegram private placeholder streams keep controls responsive and ordinary
           sendChatAction: async () => true,
           setMessageReaction: async () => true,
           sendMessage: async (payload) => { sent.push(payload); return { message_id: 900 + sent.length }; },
+          sendRichMessage: async (payload) => {
+            sent.push({ ...payload, text: payload.richMessage?.markdown });
+            return { message_id: 900 + sent.length };
+          },
           editMessageText: async (payload) => { edits.push(payload); return true; },
+          deleteMessage: async (payload) => { deleted.push(payload.messageId); return true; },
           sendRichMessageDraft: async (payload) => { drafts.push(payload); return true; },
         },
         logger: { warn() {} },
@@ -2375,9 +2412,14 @@ test('Telegram private placeholder streams keep controls responsive and ordinary
           await bounded(Promise.all([prompt, followUp]), 'queued follow-up did not complete');
           assert.deepEqual(asked, ['long task', 'ordinary follow-up']);
           assert.equal(controls.length, 0);
-          assert.equal(sent.length, 3, 'one placeholder per prompt plus the queue receipt');
+          assert.equal(sent.length, 5, 'one placeholder and one answer per prompt, plus the queue receipt');
           assert.match(sent[1].text, /已排队/);
-          assert.deepEqual(edits.map((entry) => entry.messageId), [901, 901, 903]);
+          assert.deepEqual(sent.map((entry) => entry.text).filter((text) => !/已排队/.test(text)),
+            ['正在处理…', 'final answer', '正在处理…', 'follow-up answer'],
+            'every turn answers in its own message');
+          assert.deepEqual(edits.map((entry) => entry.messageId), [901],
+            'progress stays on the placeholder');
+          assert.deepEqual(deleted, [901, 904], 'every finished turn drops its placeholder');
         } else {
           await bounded(bridge.accept(incoming(101, action === 'stop' ? '/stop' : '/steer add ANDROID_OK')),
             'control command waited for the ordinary prompt queue');
@@ -2390,9 +2432,11 @@ test('Telegram private placeholder streams keep controls responsive and ordinary
           }
           await bounded(prompt, 'the original prompt did not settle');
           assert.ok(sent.some(({ text }) => text.includes(action === 'stop' ? '已请求停止当前任务' : '已提交补充指令')));
-          assert.equal(edits.at(-1).messageId, 901);
-          assert.equal(edits.at(-1).text ?? edits.at(-1).richMessage?.markdown,
-            action === 'stop' ? '已停止。' : 'final answer');
+          assert.equal(sent.at(-1).text, action === 'stop' ? '已停止。' : 'final answer',
+            'the terminal message is a new message, not a placeholder edit');
+          assert.deepEqual(edits.map((entry) => entry.messageId), [901],
+            'progress stays on the placeholder');
+          assert.deepEqual(deleted, [901], 'the finished turn drops its placeholder');
         }
         assert.equal(drafts.length, 0);
       } finally {

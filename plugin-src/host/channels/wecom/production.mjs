@@ -110,7 +110,7 @@ export async function createProductionController(ctx, config = {}, internals = {
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
     imageInputPolicy: () => getImageInputSettingsStore(config).get(),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const coreController = new Controller({
     qrAuth,
     credentials: ctx.credentials,
@@ -123,6 +123,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         initialAccessPolicy: initialAccessPolicyFor('wecom', botConfig),
       });
       const workspaceScope = createBotWorkspaceScope(harness, {
+        dsBot: config.deliveryService?.dsBot,
         botId, workspaces, state, agentPresetCatalog,
       });
       return new Runtime({
@@ -135,6 +136,8 @@ export async function createProductionController(ctx, config = {}, internals = {
           channel: 'wecom', config: botConfig,
         }),
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+        streamRotateAfterMs: config.streamRotateAfterMs ?? 510_000,
+        streamSilentProbeMs: config.streamSilentProbeMs ?? 120_000,
         connectTimeoutMs: config.connectTimeoutMs ?? 20_000,
         maxReconnectAttempts: config.maxReconnectAttempts ?? 10,
         logger: {
@@ -174,7 +177,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   }).start();
   return {
     controller,
-    deliveryAdapter: createDeliveryAdapter({
+    deliveryAdapter: createDeliveryAdapter({ dsBot: config.deliveryService?.dsBot,
       channel: 'wecom', workspaces, coreController, stateFor,
     }),
     ready: supervisor.ready,

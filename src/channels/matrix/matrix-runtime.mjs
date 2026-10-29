@@ -22,6 +22,8 @@ import {
   normalizeMatrixDeliveryTarget,
   normalizeMatrixTimelineEvent,
   resolveBangMatrixCommand,
+  threadIdOf,
+  replyEventIdOf,
 } from './matrix-normalize.mjs';
 import {
   DEFAULT_ROOM_HISTORY_LIMIT,
@@ -36,6 +38,11 @@ import {
   extractOutboundMentions,
   hasRoomMention,
 } from './matrix-rich-text.mjs';
+import { RootContextRegistry } from '../shared/conversation/root-context.mjs';
+import { WindowAmbientProvider } from '../shared/conversation/ambient-provider.mjs';
+import { createEventLru, resolveReplyChain } from '../shared/conversation/reply-context.mjs';
+import { renderContextEntries } from '../shared/conversation/context-builder.mjs';
+import { TRIGGER_REPLY_MODES } from '../shared/conversation/trigger-policy.mjs';
 import { chunkMarkdownParts } from '../shared/markdown-chunks.mjs';
 
 const RECONNECT_DELAYS_MS = Object.freeze([1_000, 3_000, 5_000, 10_000, 30_000]);
@@ -45,6 +52,8 @@ const INVITE_JOIN_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_MESSAGE_LENGTH = 16_000;
 const DEFAULT_MAX_MEDIA_BYTES = 104_857_600;
 const EDIT_STREAM_INTERVAL_MS = 350;
+const MATRIX_THREADS_MODES = new Set(['inherit', 'isolate', 'auto']);
+const MAX_BOT_EVENT_BINDINGS = 5_000;
 
 function safeInt(value, min, max, fallback) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
@@ -264,12 +273,45 @@ export class MatrixRuntime {
       && typeof roomHistory.consumePending === 'function'
       && typeof roomHistory.pending === 'function'
       && typeof roomHistory.search === 'function'
+      && typeof roomHistory.recent === 'function'
       ? roomHistory
       : null;
     this.#roomContextLimit = safeInt(config.roomContextLimit, 1, 500, 50);
     this.#roomContextMaxChars = safeInt(config.roomContextMaxChars, 200, 200_000, 8_000);
     this.#roomContextTzOffsetMinutes = safeInt(config.roomContextTzOffsetMinutes, -840, 840, 0);
     this.#roomContextEnabled = config.roomContextEnabled !== false;
+    this.#threadsMode = MATRIX_THREADS_MODES.has(config.threadsMode) ? config.threadsMode : 'inherit';
+    this.#triggerOnReply = TRIGGER_REPLY_MODES.includes(config.triggerOnReply) ? config.triggerOnReply : 'never';
+    this.#rootOnceEnabled = config.rootContextOnceEnabled === true;
+    this.#replyContextEnabled = config.replyContextEnabled === true;
+    this.#ambientContextEnabled = config.ambientContextEnabled === true;
+    // The room-visible window is shipped on: what members can read in the room
+    // timeline reaches the model as collected context, bounded only by the
+    // window and budget knobs below.
+    this.#visibleContextEnabled = config.visibleContextEnabled !== false;
+    this.#visibleContextWindowMs = safeInt(config.visibleContextWindowMs, 10_000, 86_400_000, 600_000);
+    this.#visibleContextLimit = safeInt(config.visibleContextLimit, 1, 50, 8);
+    // Follow-up lanes for rooms run on rapid consecutive posts: a same sender's
+    // burst folds into one dispatch, and that sender's mid-turn follow-ups steer
+    // the in-flight turn rather than queueing behind the answer they correct.
+    // Other members' messages still queue one voice at a time.
+    this.#autoSteerSameSender = config.autoSteerSameSender !== false;
+    this.#autoSteerLimit = safeInt(config.autoSteerLimit, 0, 20, 5);
+    this.#coalesceWindowMs = safeInt(config.coalesceWindowMs, 0, 3_000, 450);
+    this.#visibleContextChars = safeInt(config.visibleContextChars, 200, 200_000, 4_000);
+    this.#contextMaxChars = safeInt(config.contextMaxChars, 200, 200_000, 8_000);
+    this.#replyMaxDepth = safeInt(config.replyMaxDepth, 1, 10, 5);
+    this.#rootRegistry = new RootContextRegistry({ state });
+    this.#ambientProvider = this.#roomHistory
+      ? new WindowAmbientProvider({
+        store: this.#roomHistory,
+        burstGapMs: safeInt(config.ambientBurstGapMs, 5_000, 3_600_000, 90_000),
+        recentWindowMs: safeInt(config.ambientRecentWindowMs, 10_000, 86_400_000, 180_000),
+        recentCount: safeInt(config.ambientRecentCount, 1, 200, 20),
+        maxContextChars: this.#contextMaxChars,
+      })
+      : null;
+    this.#contextEvents = createEventLru(256);
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#patterns = compileIgnorePatterns(config.ignoreUserPatterns);
     for (const roomId of toRoomSet(config.freeResponseRooms)) this.#freeRooms.add(roomId);
@@ -283,6 +325,50 @@ export class MatrixRuntime {
   #roomContextMaxChars = 8_000;
   #roomContextTzOffsetMinutes = 0;
   #roomContextEnabled = true;
+  #threadsMode = 'inherit';
+  #triggerOnReply = 'never';
+  /**
+   * Within one conversation an event enters the model as collected context at most
+   * once. The in-memory map rides on the room record's durable per-conversation
+   * ledger (`contextInjected`/`markContextInjected`), so an entry that was already
+   * offered stays retired across restarts; only a cleared session releases it.
+   */
+  #contextLedger = new Map();
+  /**
+   * Per-conversation session generation, bumped when /new clears the session. A
+   * recorded bubble's epoch retires it from its own conversation's window only
+   * while it matches this counter, so a fresh session re-reads the previous
+   * session's bubbles once instead of inheriting their retirement.
+   */
+  #turnEpochs = new Map();
+  #ledgerRouteCap = 400;
+  #ledgerEntryCap = 512;
+  /**
+   * Group senders' room-state display names. Reads are synchronous against this
+   * cache so the timeline handler never blocks on the homeserver; a miss
+   * schedules the state read and the same sender reads as its MXID localpart
+   * until the name arrives. Entries expire after the TTL and the Map evicts in
+   * insertion order beyond the cap.
+   */
+  #memberNames = new Map();
+  #memberNameCap = 512;
+  #memberNameTtlMs = 600_000;
+  #rootOnceEnabled = false;
+  #replyContextEnabled = false;
+  #ambientContextEnabled = false;
+  #visibleContextEnabled = true;
+  #visibleContextWindowMs = 600_000;
+  #visibleContextLimit = 8;
+  #autoSteerSameSender = true;
+  #autoSteerLimit = 5;
+  #coalesceWindowMs = 450;
+  #visibleContextChars = 4_000;
+  #contextMaxChars = 8_000;
+  #replyMaxDepth = 5;
+  #rootRegistry = null;
+  #ambientProvider = null;
+  #contextEvents = null;
+  #botEventBindings = new Map();
 
   get status() {
     return this.#status;
@@ -346,6 +432,15 @@ export class MatrixRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      autoSteerSameSender: this.#autoSteerSameSender,
+      autoSteerLimit: this.#autoSteerLimit,
+      coalesceWindowMs: this.#coalesceWindowMs,
+      // The binding table and the /new anchor reset serve the trigger policy and the
+      // `auto` thread router, not only the context collectors, so those modes wire the
+      // hooks even when every structured-context collector stays off.
+      contextHooks: this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
+        ? this.#createContextHooks()
+        : null,
     });
     await this.#initialSync();
     if (generation !== this.#generation) return;
@@ -625,21 +720,40 @@ export class MatrixRuntime {
         processNotices: this.#config.processNotices,
         freeResponseRooms: this.#freeRooms,
         allowedRooms: this.#allowedRooms.size > 0 ? this.#allowedRooms : null,
+        threadsMode: this.#threadsMode,
+        triggerOnReply: this.#triggerOnReply,
+        botId: this.#config.botId ?? null,
       },
       patterns: this.#patterns,
       ring: this.#ring,
       clock: this.#clock,
-      deps: { createMediaSource: (mediaContent, msgtype) => this.#createMediaSource(mediaContent, msgtype) },
+      deps: {
+        createMediaSource: (mediaContent, msgtype) => this.#createMediaSource(mediaContent, msgtype),
+        classifyReplyTarget: (eventId) => this.#classifyReplyTarget(eventId),
+        routeOverrideForReply: (eventId) => this.#routeOverrideForReply(eventId),
+        isBotRoomEvent: (roomId, eventId) => (this.#roomHistory?.kindOf({ roomId, eventId }) ?? null) === 'bot',
+      },
     });
     if (outcome.drop) {
       if (outcome.warnSkew && !this.#status.lastClockSkewAt) {
         this.#status.lastClockSkewAt = new Date().toISOString();
         this.#logger.warn?.(t('Matrix 收到的时间戳持续远落后于本机时间，检测到本机时钟超前，请校准系统时间后重启机器人。'));
       }
-      if (outcome.drop === 'mention-required') this.#recordRoomAmbient(roomId, event);
+      if (outcome.drop === 'mention-required'
+        || outcome.drop === 'reply-to-human'
+        || outcome.drop === 'reply-target-unknown') this.#recordRoomAmbient(roomId, event);
+      else if (outcome.drop === 'self') this.#recordRoomBotReply(roomId, event);
       return;
     }
     const message = { ...outcome.message };
+    if (message.kind === 'group' && typeof message.senderId === 'string' && message.senderId) {
+      const speakerName = this.#resolveSenderDisplayName(roomId, message.senderId);
+      if (speakerName) {
+        message.speakerName = speakerName;
+        const baseSource = typeof message.contextSource === 'function' ? message.contextSource() : {};
+        message.contextSource = () => ({ ...baseSource, senderName });
+      }
+    }
     if (message.addressed && typeof message.content === 'string' && message.content.startsWith('!')) {
       const resolved = resolveBangMatrixCommand(message.content, (name) => this.#isKnownCommand(name));
       if (resolved !== message.content) {
@@ -652,7 +766,7 @@ export class MatrixRuntime {
         const commandLike = isMatrixCommandLike(message.content);
         const directAddress = message.mentioned === true || Boolean(message.replyToEventId);
         this.#recordRoomHuman(message, { kind: commandLike ? 'command' : 'human', injected: true });
-        if (!commandLike && directAddress) {
+        if (!commandLike && directAddress && !this.#structuredContextActive()) {
           const block = this.#consumeRoomContext(message.roomId);
           if (block) {
             const label = t('【下面这条才是对你的提问，请只回答它】');
@@ -671,6 +785,357 @@ export class MatrixRuntime {
     }
   }
 
+  #structuredContextActive() {
+    return this.#rootOnceEnabled === true
+      || this.#replyContextEnabled === true
+      || this.#ambientContextEnabled === true
+      || this.#visibleContextEnabled === true;
+  }
+
+  /** Sync classifier fed to the trigger table: a bound event id proves bot authorship. */
+  #classifyReplyTarget(eventId) {
+    return typeof eventId === 'string' && this.#botEventBindings.has(eventId) ? 'bot' : null;
+  }
+
+  /** The `auto` thread mode's routing hint: the conversation a reply target belongs to. */
+  #routeOverrideForReply(eventId) {
+    if (typeof eventId !== 'string') return null;
+    return this.#botEventBindings.get(eventId)?.conversationKey ?? null;
+  }
+
+  /**
+   * The conversation's current session generation. A live clear updates the in-memory
+   * counter; after a restart the durable counter in the room record keeps retired
+   * answers retired without a read-back.
+   */
+  #contextEpoch(conversationKey) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return 0;
+    const live = this.#turnEpochs.get(conversationKey);
+    if (Number.isSafeInteger(live) && live >= 0) return live;
+    return this.#roomHistory?.contextEpoch({ conversationKey }) ?? 0;
+  }
+
+  #recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds }) {
+    if (!Array.isArray(providerMessageIds) || providerMessageIds.length === 0) return;
+    for (const eventId of providerMessageIds) {
+      if (typeof eventId !== 'string' || !eventId) continue;
+      const boundKey = typeof conversationKey === 'string' && conversationKey ? conversationKey : null;
+      this.#botEventBindings.set(eventId, {
+        conversationKey: boundKey,
+        sessionId: typeof sessionId === 'string' && sessionId ? sessionId : null,
+        // The session generation live at delivery, the same stamp the room-visible
+        // record carries at the send exit: after /new bumps the epoch, the former
+        // session's bubbles are no longer this conversation's own words.
+        turnEpoch: boundKey ? this.#contextEpoch(boundKey) : null,
+        at: Date.now(),
+      });
+    }
+    while (this.#botEventBindings.size > MAX_BOT_EVENT_BINDINGS) {
+      const oldest = this.#botEventBindings.keys().next().value;
+      this.#botEventBindings.delete(oldest);
+    }
+  }
+
+  /**
+   * Whether an event is this conversation's own answer of the current session
+   * generation. Its text is transcript content already, so no collection lane may
+   * re-serve it as room speech, however the trigger reached it. The provenance
+   * rides the delivery binding (`#recordBotEventDelivery`); once `/new` bumps the
+   * generation, the successor conversation no longer claims the bubble and reads
+   * it back through the windows once.
+   */
+  #isOwnCurrentAnswer(conversationKey, eventId) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return false;
+    if (typeof eventId !== 'string' || !eventId) return false;
+    const binding = this.#botEventBindings.get(eventId);
+    if (!binding || binding.conversationKey !== conversationKey) return false;
+    return Number.isSafeInteger(binding.turnEpoch) && binding.turnEpoch >= 0
+      && binding.turnEpoch === this.#contextEpoch(conversationKey);
+  }
+
+  /**
+   * Resolve one event for the context collectors through the CS API single-event
+   * endpoint, decrypting when the room is end-to-end encrypted. Resolved lookups
+   * (including misses) are cached per room so a burst of replies into one chain
+   * does not refetch shared ancestors.
+   */
+  async #fetchContextEvent(roomId, eventId) {
+    if (!this.#api || typeof this.#api.getEvent !== 'function') return null;
+    if (typeof eventId !== 'string' || !eventId) return null;
+    const cacheKey = `${roomId}|${eventId}`;
+    const cached = this.#contextEvents.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const event = await this.#api.getEvent(roomId, eventId).catch(() => null);
+    let resolved = null;
+    if (event && typeof event.content === 'object' && event.content !== null) {
+      let content = event.content;
+      if (event.type === 'm.room.encrypted' && this.#crypto) {
+        content = (await this.#crypto.decryptRoomEvent(roomId, event).catch(() => null))?.content ?? null;
+      }
+      const body = typeof content?.body === 'string' ? content.body : '';
+      if (body) {
+        // Chain walking follows genuine reply relations only; a falling-back
+        // relation is the thread-membership declaration, not a reply target.
+        const replyTo = replyEventIdOf(content);
+        resolved = {
+          sender: typeof event.sender === 'string' ? event.sender : '',
+          name: '',
+          text: body,
+          ts: Number.isSafeInteger(event.origin_server_ts) && event.origin_server_ts > 0 ? event.origin_server_ts : null,
+          replyTo,
+        };
+      }
+    }
+    this.#contextEvents.set(cacheKey, resolved);
+    return resolved;
+  }
+
+  #contextAlreadyInjected(conversationKey, eventId) {
+    if (typeof conversationKey !== 'string' || !conversationKey || typeof eventId !== 'string' || !eventId) return false;
+    if (this.#contextLedger.get(conversationKey)?.has(eventId) === true) return true;
+    return this.#roomHistory?.contextInjected({ conversationKey, eventId }) === true;
+  }
+
+  #markContextInjected(conversationKey, eventIds) {
+    if (typeof conversationKey !== 'string' || !conversationKey || eventIds.length === 0) return;
+    let seen = this.#contextLedger.get(conversationKey);
+    if (seen) {
+      // Recency follows the last injection, so the route cap evicts the stalest conversation.
+      this.#contextLedger.delete(conversationKey);
+      this.#contextLedger.set(conversationKey, seen);
+    } else {
+      seen = new Set();
+      this.#contextLedger.set(conversationKey, seen);
+      while (this.#contextLedger.size > this.#ledgerRouteCap) {
+        const oldest = this.#contextLedger.keys().next().value;
+        if (oldest === conversationKey && this.#contextLedger.size === 1) break;
+        this.#contextLedger.delete(oldest);
+      }
+    }
+    for (const eventId of eventIds) {
+      seen.add(eventId);
+      while (seen.size > this.#ledgerEntryCap) {
+        seen.delete(seen.values().next().value);
+      }
+    }
+    this.#roomHistory?.markContextInjected({ conversationKey, eventIds });
+  }
+
+  /**
+   * The bridge-facing context pipeline. Collection runs after command handling
+   * so commands never pay for a lookup; consumption markers are applied only when
+   * the turn completed successfully, and delivered event ids feed the binding
+   * table that classifies reply targets and routes `auto` thread replies.
+   */
+  #createContextHooks() {
+    return {
+      enabled: () => this.#structuredContextActive(),
+      collect: async ({ message, conversationKey, sessionIdHint }) => {
+        const entries = [];
+        let used = 0;
+        const placeholder = t('正在处理…');
+        // The coalescer folded this turn out of several bubbles: the extra
+        // members are already spoken here as the turn's own words, so the
+        // windows retire them with the turn instead of re-serving that text a
+        // turn later.
+        if (Array.isArray(message.coalescedEventIds)) {
+          this.#markContextInjected(conversationKey, message.coalescedEventIds.filter(
+            (eventId) => typeof eventId === 'string' && eventId,
+          ));
+        }
+        const offer = (entry) => {
+          if (entry.eventId && entries.some((existing) => existing.eventId === entry.eventId)) return false;
+          // An event whose fetched body is still the pending-placeholder
+          // template carries no content members can read: homeservers hand
+          // back the pre-edit body, so the receipt never enters the context.
+          if (typeof entry.text === 'string' && entry.text.trim() === placeholder) return false;
+          const cost = (typeof entry.text === 'string' ? entry.text.length : 0) + 48;
+          if (used + cost > this.#contextMaxChars) return false;
+          used += cost;
+          entries.push(entry);
+          return true;
+        };
+        const roomId = typeof message.roomId === 'string' ? message.roomId : '';
+        if (this.#rootOnceEnabled && message.kind === 'group'
+          && typeof message.threadId === 'string' && message.threadId) {
+          const plan = this.#rootRegistry.plan({
+            routeKey: conversationKey,
+            sessionId: sessionIdHint,
+            rootId: message.threadId,
+          });
+          if (plan.inject && !this.#contextAlreadyInjected(conversationKey, message.threadId)) {
+            const rootId = message.threadId;
+            const root = await this.#fetchContextEvent(roomId, rootId);
+            // A pending placeholder that opened the thread reads as its receipt
+            // line in the thread header, not as question content; what members can
+            // read of that answer is the final body, which reaches the model
+            // through the same-list room-visible record instead, so a
+            // placeholder root contributes no entry of its own.
+            if (root && root.text !== placeholder && !this.#contextAlreadyInjected(conversationKey, rootId)) {
+              offer({
+                collector: 'thread-root',
+                roomId,
+                eventId: rootId,
+                sender: root.sender,
+                name: root.name,
+                ts: root.ts,
+                text: root.text,
+              });
+            }
+          }
+        }
+        if (this.#replyContextEnabled
+          && typeof message.replyToEventId === 'string' && message.replyToEventId) {
+          const chain = await resolveReplyChain({
+            fetch: (eventId) => this.#fetchContextEvent(roomId, eventId),
+            startReplyTo: message.replyToEventId,
+            maxDepth: this.#replyMaxDepth,
+          });
+          // A machine receipt is not a human target: the chain answers only up
+          // to the pending-placeholder body (oldest ancestor first, so entries
+          // nearer the trigger follow it). The walk ends at the receipt and the
+          // question behind a placeholder never crosses into the panel above it.
+          const receiptAt = chain.findIndex(
+            (node) => typeof node.text === 'string' && node.text.trim() === placeholder,
+          );
+          const walkable = receiptAt >= 0 ? chain.slice(receiptAt + 1) : chain;
+          for (const node of walkable) {
+            if (this.#contextAlreadyInjected(conversationKey, node.eventId)) continue;
+            // The quote is a platform fact, yet the bubble behind it can be this
+            // conversation's own answer of the current generation: transcript
+            // content already, held out of the context as the room window holds it.
+            if (this.#isOwnCurrentAnswer(conversationKey, node.eventId)) continue;
+            if (!offer({
+              collector: 'reply',
+              roomId,
+              eventId: node.eventId,
+              sender: node.sender,
+              name: node.name,
+              ts: node.ts,
+              text: node.text,
+            })) break;
+          }
+        }
+        // The room-visible window backfills the surrounding readback an
+        // elliptical follow-up leans on — earlier answered questions and the
+        // bot's own results included — whatever the other collectors did not
+        // already carry and this conversation has not seen yet. It leads the
+        // ambient queries so the chronological room window keeps the earlier
+        // slots; the offer guard then keeps later collectors from repeating it.
+        if (this.#visibleContextEnabled && message.kind === 'group' && this.#roomHistory) {
+          const seenEventIds = new Set(entries.map((entry) => entry.eventId).filter(Boolean));
+          if (typeof message.messageId === 'string' && message.messageId) seenEventIds.add(message.messageId);
+          const window = this.#roomHistory.recent({
+            roomId,
+            threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
+            exclude: seenEventIds,
+            limit: this.#visibleContextLimit,
+            maxChars: this.#visibleContextChars,
+            sinceTs: Date.now() - this.#visibleContextWindowMs,
+          });
+          for (const record of window) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
+            // What this conversation's own current session produced already sits in
+            // its transcript; re-serving it as room speech duplicates the model's
+            // own words. Other conversations and a since-cleared session (newer
+            // epoch) keep reading the bubble — its root-bubble panel role survives.
+            if (record.turnKey === conversationKey
+              && record.turnEpoch === this.#contextEpoch(conversationKey)) continue;
+            if (!offer({
+              collector: 'room-visible',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+        }
+        if (this.#ambientContextEnabled && message.kind === 'group' && this.#ambientProvider) {
+          const { burst, recent } = this.#ambientProvider.query({
+            roomId,
+            senderId: typeof message.senderId === 'string' ? message.senderId : '',
+            threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
+          });
+          for (const record of burst) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
+            if (!offer({
+              collector: 'ambient-burst',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+          for (const record of recent) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
+            if (!offer({
+              collector: 'ambient-recent',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+        }
+        // The trigger body itself now rides this conversation's model input; the
+        // ledger records that so a later turn's room-visible window never
+        // re-serves the question the session already answered verbatim.
+        if (typeof message.messageId === 'string' && message.messageId) {
+          this.#markContextInjected(conversationKey, [message.messageId]);
+        }
+        return entries;
+      },
+      render: (entries) => renderContextEntries(entries),
+      onConsumed: async ({ conversationKey, sessionId, entries }) => {
+        const ambient = entries.filter((entry) => entry.collector === 'ambient-burst' || entry.collector === 'ambient-recent');
+        if (ambient.length > 0 && this.#ambientProvider) {
+          await this.#ambientProvider.markConsumed({ roomId: ambient[0]?.roomId, entries: ambient });
+        }
+        const root = entries.find((entry) => entry.collector === 'thread-root');
+        if (root && typeof sessionId === 'string' && sessionId) {
+          await this.#rootRegistry.markInjected({ routeKey: conversationKey, sessionId, rootId: root.eventId });
+        }
+        const collected = entries.filter((entry) => entry.collector === 'reply' || entry.collector === 'thread-root' || entry.collector === 'room-visible');
+        if (collected.length > 0) {
+          this.#markContextInjected(conversationKey, collected.map((entry) => entry.eventId).filter(Boolean));
+        }
+      },
+      /**
+       * The steered body reached the Session inside the in-flight turn, exactly
+       * like a folded coalescer member: retire its bubble with the turn so the
+       * window never re-serves text the same session has already taken in.
+       */
+      onSteered: async ({ conversationKey, messageId }) => {
+        if (typeof messageId === 'string' && messageId) {
+          this.#markContextInjected(conversationKey, [messageId]);
+        }
+      },
+      onSessionCleared: async (conversationKey) => {
+        await this.#rootRegistry.clearRoute(conversationKey);
+        this.#contextLedger.delete(conversationKey);
+        // The successor session never saw the previous one's answers; bumping the
+        // generation lifts their retirement so they read back into this window once.
+        // The durable ledger and the durable generation carry the same reset across a
+        // restart, so the read-back stays bounded to once per conversation instead of
+        // recurring on every reboot.
+        const durable = this.#roomHistory ? this.#roomHistory.bumpContextEpoch({ conversationKey }) : null;
+        this.#turnEpochs.set(conversationKey, Number.isSafeInteger(durable) && durable > 0
+          ? durable
+          : (this.#turnEpochs.get(conversationKey) ?? 0) + 1);
+        this.#roomHistory?.clearContextInjected({ conversationKey });
+      },
+      onDelivered: async ({ conversationKey, sessionId, providerMessageIds }) => {
+        this.#recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds });
+      },
+    };
+  }
+
   #recordRoomAmbient(roomId, event) {
     if (!this.#roomHistory || !this.#roomContextEnabled) return;
     if (this.#dmRooms.has(roomId)) return;
@@ -686,8 +1151,55 @@ export class MatrixRuntime {
       sender,
       text: body,
       ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
+      threadId: threadIdOf(event?.content),
       kind: 'human',
       injected: false,
+    });
+  }
+
+  // One recorded bot message, from any exit that reaches the room: a plain
+  // send, an edit frame of a streamed answer, or an echoed timeline event.
+  // The pending placeholder carries no content and stays out of the record.
+  #recordBotRoomMessage({ roomId, eventId, text, threadId = null, edit = false, turnKey = null }) {
+    if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
+    if (this.#dmRooms.has(roomId)) return;
+    const body = typeof text === 'string' ? text.trim() : '';
+    if (!eventId) return;
+    const turnEpoch = turnKey === null ? null : this.#contextEpoch(turnKey);
+    const self = this.#botUserId ?? '';
+    const name = self ? this.#resolveSenderDisplayName(roomId, self) : null;
+    const ts = Date.now();
+    // A pending placeholder earns a content-free bot receipt: the window never
+    // renders an empty entry, while the fork policy and the final edit frames
+    // (which revise the same entry to the read body) both key off this id.
+    if (!body || body === t('正在处理…')) {
+      this.#roomHistory.append({ roomId, eventId, sender: self, name, text: '', ts, threadId, kind: 'bot', turnKey, turnEpoch });
+      return;
+    }
+    if (edit) {
+      this.#roomHistory.revise({ roomId, eventId, sender: self, name, text: body, ts, threadId, turnKey, turnEpoch });
+      return;
+    }
+    this.#roomHistory.append({ roomId, eventId, sender: self, name, text: body, ts, threadId, kind: 'bot', turnKey, turnEpoch });
+  }
+
+  // The timeline face of bot authorship: kept for homeservers that echo bot
+  // events back, coalescing by event id with the send-face records. Edit
+  // frames are owned by the send-face revising writer and skip here so one
+  // streamed answer never lands twice under relation ids.
+  #recordRoomBotReply(roomId, event) {
+    if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
+    const content = event?.content;
+    if (content?.['m.new_content'] || content?.['m.rel_type'] === 'm.replace') return;
+    const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
+    const body = typeof content?.body === 'string' ? content.body : '';
+    const msgtype = content?.msgtype;
+    if (msgtype && msgtype !== 'm.text') return;
+    this.#recordBotRoomMessage({
+      roomId,
+      eventId,
+      text: body,
+      threadId: threadIdOf(content),
     });
   }
 
@@ -703,6 +1215,7 @@ export class MatrixRuntime {
       sender: message.senderId,
       text,
       ts: Date.now(),
+      threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
       kind,
       injected,
     });
@@ -842,6 +1355,33 @@ export class MatrixRuntime {
     return await api.sendEvent(roomId, eventType, content, options);
   }
 
+  // Resolves a group sender's display name without blocking the synchronous
+  // timeline handler: a fresh entry answers at once, a stale entry still beats
+  // the localpart while the refresh runs, and a miss labels with the MXID
+  // localpart while the room state read fills the cache for later turns.
+  #resolveSenderDisplayName(roomId, senderId) {
+    const key = `${roomId}|${senderId.toLowerCase()}`;
+    const hit = this.#memberNames.get(key);
+    if (hit && hit.at + this.#memberNameTtlMs > Date.now()) return hit.name;
+    const api = this.#api;
+    if (typeof api?.getRoomMemberDisplayName === 'function') {
+      Promise.resolve(api.getRoomMemberDisplayName(roomId, senderId))
+        .then((name) => {
+          if (!name) return;
+          this.#memberNames.delete(key);
+          this.#memberNames.set(key, { name, at: Date.now() });
+          while (this.#memberNames.size > this.#memberNameCap) {
+            this.#memberNames.delete(this.#memberNames.keys().next().value);
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (hit) return hit.name;
+    const local = senderId.startsWith('@') ? senderId.slice(1) : senderId;
+    const colon = local.indexOf(':');
+    return (colon > 0 ? local.slice(0, colon) : local) || null;
+  }
+
   #createMediaSource(content, msgtype) {
     const encrypted = content?.file && typeof content.file === 'object' ? content.file : null;
     const contentUri = cleanString(content?.url ?? encrypted?.url);
@@ -909,6 +1449,11 @@ export class MatrixRuntime {
     };
   }
 
+  /** The conversation key a turn-bound delivery target was stamped with, or null for a local send. */
+  #targetTurnKey(target) {
+    return typeof target?.dshTurnKey === 'string' && target.dshTurnKey ? target.dshTurnKey : null;
+  }
+
   async #sendRoomText(target, text, options = {}) {
     const api = this.#api;
     if (!api) throw new Error('Matrix bot is not connected');
@@ -924,22 +1469,32 @@ export class MatrixRuntime {
     const providerMessageIds = [];
     for (const chunk of chunks) {
       let content;
+      let sentBody;
       try {
         content = buildMatrixTextContent({
           text: chunk.markdown,
           mentionUserIds: extractOutboundMentions(chunk.markdown),
           roomMention: this.#config.allowRoomMentions && hasRoomMention(chunk.markdown),
         });
+        sentBody = typeof content.body === 'string' && content.body ? content.body : chunk.plain;
       } catch {
         this.#logger.warn?.('[dsh-im:matrix] Rich text could not be prepared; sending plain text');
         if (!chunk.plain) continue;
         content = { msgtype: 'm.text', body: chunk.plain };
+        sentBody = chunk.plain;
       }
       applyMatrixRelations(content, { threadId, replyToEventId });
       const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, {
         ...(options.signal ? { signal: options.signal } : {}),
       });
       if (typeof result?.event_id === 'string') providerMessageIds.push(result.event_id);
+      // The send exits are the trusted record of what the room received: this
+      // deployment's homeserver verifiably does not echo bot-authored events
+      // back onto the timeline, so the room-visible store is fed here too and
+      // coalesces with any echo a different server does deliver.
+      if (options.recordRoom !== false) {
+        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: sentBody, threadId, turnKey: this.#targetTurnKey(target) });
+      }
     }
     return { providerMessageIds };
   }
@@ -972,6 +1527,11 @@ export class MatrixRuntime {
           };
         }
         await this.#sendRoomEvent(roomId, 'm.room.message', content);
+        // Every edit frame revises the same entry, so the store ends holding the
+        // final body members read in the room regardless of frame count. The turn
+        // stamp rides the same target the stream opened under, so the placeholder
+        // receipt and its final body share one provenance.
+        this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true, turnKey: this.#targetTurnKey(target) });
       },
       sendRemainder: async (chunk) => await this.#sendRoomText(target, chunk),
       messageIdForResult: (result) => result?.providerMessageIds?.at(-1) ?? null,

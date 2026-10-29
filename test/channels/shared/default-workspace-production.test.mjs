@@ -10,7 +10,11 @@ const channels = ['weixin', 'wecom', 'wecom-app', 'feishu', 'dingtalk', 'qq', 's
 for (const channel of channels) {
   test(channel + ' creates the IM directory only for bots that select it, including after reload', async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-default-' + channel + '-'));
-    t.after(() => rm(root, { recursive: true, force: true }));
+    const disposers = [];
+    t.after(async () => {
+      for (const dispose of disposers.reverse()) await dispose?.();
+      await rm(root, { recursive: true, force: true });
+    });
     const { createProductionController } = await import('../../../plugin-src/host/channels/' + channel + '/production.mjs');
     for (const mode of ['default', 'channel', 'saved']) {
       const dshHome = join(root, mode);
@@ -50,6 +54,7 @@ for (const channel of channels) {
       const start = () => createProductionController({
         credentials: {}, typertGateway: { invoke() {}, stream() {} },
         logger: () => ({ error() {}, warn() {}, info() {}, debug() {} }),
+        effect: (setup) => { disposers.push(setup()); },
       }, { dshHome, workspacesPath, ...(mode === 'channel' ? { workspace } : {}) }, {
         ConfigStore, StateStore, HarnessClient: Harness, Controller, Runtime, FeishuRuntime: Runtime,
         CallbackServer, api: {}, qrAuth: {}, deviceAuth: {}, lark: {}, proxyEnv: {},

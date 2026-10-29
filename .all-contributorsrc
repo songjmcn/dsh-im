@@ -151,6 +151,22 @@
       ]
     },
     {
+      "login": "chentianhai4",
+      "name": "chentianhai4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/181718696",
+      "profile": "https://github.com/chentianhai4",
+      "contributions": [
+        {
+          "type": "code",
+          "url": "https://github.com/xmanrui/dsh-im/pull/392"
+        },
+        {
+          "type": "test",
+          "url": "https://github.com/xmanrui/dsh-im/pull/392"
+        }
+      ]
+    },
+    {
       "login": "cherryFloris",
       "name": "cherryFloris",
       "avatar_url": "https://avatars.githubusercontent.com/u/79453414",
@@ -535,6 +551,18 @@
       ]
     },
     {
+      "login": "lysgithub0302",
+      "name": "木鱼和尚",
+      "avatar_url": "https://avatars.githubusercontent.com/u/91652711",
+      "profile": "https://github.com/lysgithub0302",
+      "contributions": [
+        {
+          "type": "code",
+          "url": "https://github.com/xmanrui/dsh-im/pull/387"
+        }
+      ]
+    },
+    {
       "login": "lyzhu86",
       "name": "lyzhu86",
       "avatar_url": "https://avatars.githubusercontent.com/u/276197423",
@@ -691,6 +719,22 @@
         {
           "type": "doc",
           "url": "https://github.com/xmanrui/dsh-im/commit/ed47ae7db87d08a12fc6412083ece05669372929"
+        }
+      ]
+    },
+    {
+      "login": "unera",
+      "name": "Dmitry E. Oboukhov",
+      "avatar_url": "https://avatars.githubusercontent.com/u/538980",
+      "profile": "https://github.com/unera",
+      "contributions": [
+        {
+          "type": "code",
+          "url": "https://github.com/xmanrui/dsh-im/pull/414"
+        },
+        {
+          "type": "test",
+          "url": "https://github.com/xmanrui/dsh-im/pull/414"
         }
       ]
     },

@@ -1,3 +1,4 @@
+import { captureGroupHistory, groupHistoryEntry } from '../shared/group-history.mjs';
 import { createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { createHash, randomBytes } from 'node:crypto';
 
@@ -311,6 +312,7 @@ function whatsappAccountMatcher(accountJid, aliases) {
 export function normalizeWhatsappMessage(message, accountJid, {
   download = downloadMediaMessage,
   accountAliases = [],
+  isBotMessage = () => false,
 } = {}) {
   const remoteJid = typeof message?.key?.remoteJid === 'string' ? message.key.remoteJid : '';
   const alternateRemoteJid = typeof message?.key?.remoteJidAlt === 'string'
@@ -332,8 +334,11 @@ export function normalizeWhatsappMessage(message, accountJid, {
   const context = messageContext(content);
   const mentioned = Array.isArray(context?.mentionedJid)
     && context.mentionedJid.some(matchesAccount);
-  const replyToSelf = typeof context?.participant === 'string'
-    && matchesAccount(context.participant);
+  // The linked account also sends human messages. Only a known bot message
+  // in this chat counts as a reply trigger, not every reply to the account.
+  const replyToBot = typeof context?.participant === 'string'
+    && matchesAccount(context.participant)
+    && isBotMessage(remoteJid, context.stanzaId) === true;
   const image = whatsappImageSource(message, content, download, { viewOnce });
   const file = whatsappFileSource(message, content, download);
   const replyTo = whatsappReplyReference(context);
@@ -352,7 +357,7 @@ export function normalizeWhatsappMessage(message, accountJid, {
     images: image ? [image] : [],
     files: file ? [file] : [],
     ...(replyTo ? { replyTo } : {}),
-    addressed: !group || fromMe || mentioned || replyToSelf,
+    addressed: !group || mentioned || replyToBot,
     selfChat,
     replyTarget: { jid: remoteJid, quoted: message, selfChat },
     reactionTarget: { jid: remoteJid, key: message.key },
@@ -462,6 +467,7 @@ function whatsappArtifactError(error) {
 export class WhatsappBotClient {
   #socket;
   #outboundIds;
+  #rememberBotMessage;
   #signal;
   #abortController = new AbortController();
   #mediaUploadTimeoutMs;
@@ -473,9 +479,11 @@ export class WhatsappBotClient {
     signal,
     mediaUploadTimeoutMs = WHATSAPP_MEDIA_UPLOAD_TIMEOUT_MS,
     logger = console,
+    rememberBotMessage = async () => {},
   } = {}) {
     this.#socket = socket;
     this.#outboundIds = outboundIds;
+    this.#rememberBotMessage = rememberBotMessage;
     this.#signal = signal
       ? AbortSignal.any([signal, this.#abortController.signal])
       : this.#abortController.signal;
@@ -530,6 +538,7 @@ export class WhatsappBotClient {
     );
     const result = await waitWithSignal(pending, this.#signal);
     this.#outboundIds.remember(result?.key?.id);
+    await this.#rememberBotMessage(target.jid, edit?.id ?? result?.key?.id ?? messageId);
     return {
       ...result,
       key: { remoteJid: target.jid, fromMe: true, id: messageId, ...result?.key },
@@ -663,6 +672,7 @@ export class WhatsappBotClient {
     }
     this.#signal?.throwIfAborted();
     this.#outboundIds.remember(result?.key?.id);
+    await this.#rememberBotMessage(target.jid, result?.key?.id ?? messageId);
     return result;
   }
 
@@ -715,6 +725,7 @@ export class WhatsappRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -735,6 +746,7 @@ export class WhatsappRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -750,6 +762,7 @@ export class WhatsappRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'whatsapp', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -800,6 +813,7 @@ export class WhatsappRuntime {
         onMessage: async (raw, context) => {
           const linkedAccount = context?.socket?.user;
           const message = normalizeWhatsappMessage(raw, this.#config.accountJid, {
+            isBotMessage: (jid, id) => this.#state.isBotMessage?.(jid, id) === true,
             accountAliases: [
               linkedAccount?.id,
               linkedAccount?.lid,
@@ -811,6 +825,22 @@ export class WhatsappRuntime {
             }),
           });
           if (!message || outboundIds.has(message.providerMessageId) || !this.#bridge) return;
+          let groupName;
+          if (this.#groupHistory && message.kind === 'group' && message.addressed) {
+            let timeout;
+            try {
+              groupName = (await Promise.race([
+                context?.socket?.groupMetadata?.(message.conversationId),
+                new Promise((resolve) => { timeout = setTimeout(resolve, 2500); timeout.unref?.(); }),
+              ]))?.subject;
+            } catch { /* optional metadata must not block normal replies */ }
+            finally { clearTimeout(timeout); }
+          }
+          if (!hasViewOnceWrapper(raw.message)) {
+            await captureGroupHistory(this.#groupHistory, message, groupHistoryEntry('whatsapp', raw, message, { groupName }), {
+              logger: this.#logger,
+            });
+          }
           this.#status.lastCheckedAt = Date.now();
           await this.#bridge.accept(message);
         },
@@ -838,6 +868,15 @@ export class WhatsappRuntime {
         throw new Error('WhatsApp linked account does not match the saved bot');
       }
       const client = new WhatsappBotClient(session.socket, outboundIds, {
+        rememberBotMessage: async (jid, id) => {
+          try {
+            await this.#state.rememberBotMessage?.(jid, id);
+          } catch (error) {
+            // Delivery already succeeded; a bookkeeping failure must not turn
+            // it into a failed send that can be retried and duplicated.
+            this.#logger.warn?.('[dsh-im:whatsapp] failed to persist bot message identity:', error);
+          }
+        },
         signal: controller.signal,
         mediaUploadTimeoutMs: this.#mediaUploadTimeoutMs,
         logger: this.#logger,

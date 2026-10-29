@@ -1,3 +1,4 @@
+import { groupHistoryAccess } from './group-history-access.mjs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -22,6 +23,9 @@ import { imSourceGuidance } from './im-source-guidance.mjs';
 import { outboundArtifactRegistry } from './semantic/artifact.mjs';
 import { t } from './i18n.mjs';
 import { watchHarnessMux } from './harness-mux.mjs';
+import { extractConnectionEvidence, messageDiagnosticError } from './connection-error.mjs';
+import { PromptFailureTracker } from './prompt-failure-tracker.mjs';
+import { isSessionLogCorrupt, isSessionNotFound } from './session-error.mjs';
 
 // Every channel plugin runs in the same Host process. Sharing ownership by
 // Host identity (or an explicitly configured HTTP origin) prevents clients
@@ -29,9 +33,27 @@ import { watchHarnessMux } from './harness-mux.mjs';
 // from claiming or cancelling each other's interactions.
 const interactionRegistries = new Map();
 const hostInteractionRegistries = new WeakMap();
+const modelCatalogCaches = new WeakMap();
+const MODEL_CATALOG_TTL_MS = 30_000;
 const MAX_ERROR_CLASSIFICATION_BYTES = 64;
 const IM_INPUT_ORIGIN_TTL_MS = 30 * 60 * 1000;
 const MAX_IM_INPUT_ORIGINS = 4096;
+
+function invalidateModelCatalog(entry) {
+  if (!entry) return;
+  entry.value = null;
+  entry.expiresAt = 0;
+  // Old readers may finish, but must not repopulate the cache after a fresh read.
+  entry.pending = null;
+}
+
+export function clearModelCatalogCache(apiProxy) {
+  const entry = modelCatalogCaches.get(apiProxy);
+  if (!entry) return;
+  modelCatalogCaches.delete(apiProxy);
+  invalidateModelCatalog(entry);
+  entry.controller.abort(new DOMException('Harness model catalog disposed', 'AbortError'));
+}
 
 function clientTimeZoneFields() {
   try {
@@ -563,6 +585,7 @@ export function harnessToolCallFromEvent(event) {
 
 export class HarnessReplyTracker {
   #promptRpcId;
+  #promptFailure;
   #lastSeq;
   #openTurn = null;
   #targetTurn = null;
@@ -580,6 +603,7 @@ export class HarnessReplyTracker {
 
   constructor({ promptRpcId, afterSeq = -1, reasoning = false, finalAnswerOnly = false }) {
     this.#promptRpcId = promptRpcId;
+    this.#promptFailure = new PromptFailureTracker(promptRpcId, afterSeq);
     this.#lastSeq = afterSeq;
     // Reasoning updates are opt-in per consumer: only channels that surface
     // thinking traces (Telegram thinking mode) subscribe; every other channel
@@ -678,6 +702,7 @@ export class HarnessReplyTracker {
       // The mux is lossy across reconnects. Only history may advance the
       // durable cursor or finish the reply; the mux supplements reasoning.
       if (fromMux && !isReasoning) continue;
+      const failedTurn = fromMux ? null : this.#promptFailure.consume(event);
       if (isReasoning) {
         if (!live || !Number.isFinite(seq)) continue;
         if (this.#targetTurn === null) this.#bufferReasoning(event);
@@ -701,8 +726,12 @@ export class HarnessReplyTracker {
               this.#emitReasoning(pending, pushUpdate);
             }
           }
+          continue;
         }
-        continue;
+        // Model resolution or pre-step hooks can fail after the inbox claim
+        // but before user/message. Only a proved claim may close this wait.
+        if (event.type !== 'turn/end' || failedTurn === null || failedTurn !== event.data?.turn) continue;
+        this.#targetTurn = failedTurn;
       }
       if (seq <= this.#lastSeq) continue;
       this.#lastSeq = seq;
@@ -1187,9 +1216,46 @@ export class HarnessClient {
   }
 
   async listModels(options = {}) {
+    options.signal?.throwIfAborted();
     await this.ensureRunning(options);
-    const value = await this.rpc('llm.models', {}, 30_000, options);
-    return validateModelCatalog(value, 'llm.models');
+    options.signal?.throwIfAborted();
+    if (!this.#apiProxy || options.fresh === true) {
+      try {
+        const value = await this.rpc('llm.models', {}, 30_000, options);
+        return validateModelCatalog(value, 'llm.models');
+      } finally {
+        if (this.#apiProxy) invalidateModelCatalog(modelCatalogCaches.get(this.#apiProxy));
+      }
+    }
+
+    let entry = modelCatalogCaches.get(this.#apiProxy);
+    if (!entry) {
+      entry = { value: null, expiresAt: 0, pending: null, controller: new AbortController() };
+      modelCatalogCaches.set(this.#apiProxy, entry);
+    }
+    if (entry.value && Date.now() < entry.expiresAt) return structuredClone(entry.value);
+    if (!entry.pending) {
+      // The Host owns this read; one caller cancelling must not cancel its peers.
+      const pending = this.rpc('llm.models', {}, 30_000, {
+        ...options, signal: entry.controller.signal,
+      }).then((value) => {
+        const catalog = structuredClone(validateModelCatalog(value, 'llm.models'));
+        if (modelCatalogCaches.get(this.#apiProxy) === entry && entry.pending === pending) {
+          entry.value = catalog;
+          entry.expiresAt = Date.now() + MODEL_CATALOG_TTL_MS;
+        }
+        return catalog;
+      }).finally(() => {
+        if (entry.pending === pending) entry.pending = null;
+      });
+      entry.pending = pending;
+    }
+    const pending = entry.pending;
+    const value = await callWithSignal(
+      () => pending,
+      options.signal ?? entry.controller.signal,
+    );
+    return structuredClone(value);
   }
 
   async getSessionModels(sessionId, options = {}) {
@@ -1224,13 +1290,18 @@ export class HarnessClient {
           : { reasoningEffort: selection.reasoningEffort }),
       }, 30_000, signal ? { ...options, signal } : options);
     };
-    const value = this.#sessionMaintenanceExecutor
-      ? await this.#sessionMaintenanceExecutor({ sessionId, operation })
-      : await operation();
-    if (!value || typeof value !== 'object' || !validModelSelection(value.selected)) {
-      throw new Error('Harness returned an invalid response for session.selectModel');
+    try {
+      const value = this.#sessionMaintenanceExecutor
+        ? await this.#sessionMaintenanceExecutor({ sessionId, operation })
+        : await operation();
+      if (!value || typeof value !== 'object' || !validModelSelection(value.selected)) {
+        throw new HarnessTransportError('harness-response-invalid', 'session.selectModel');
+      }
+      return value;
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw messageDiagnosticError(error, { stage: 'session.prepare', sessionId });
     }
-    return value;
   }
 
   async isSessionRunning(sessionId, options = {}) {
@@ -1251,7 +1322,10 @@ export class HarnessClient {
   }
 
   async adoptWorkspaceSession(value, options = {}) {
-    return adoptRegisteredWorkspaceSession(this, value, options);
+    // Modern Hosts separate observing an existing Session from creating one.
+    // Keep the legacy transport contract for Hosts without this adapter seam.
+    const method = typeof this.#apiProxy?.sessions?.adopt === 'function' ? 'session.adopt' : 'session.create';
+    return adoptRegisteredWorkspaceSession(this, value, options, 30_000, method);
   }
 
   async isUngroupedWorkspace(workspace) {
@@ -1279,6 +1353,9 @@ export class HarnessClient {
     const agentPreset = requestedPreset !== undefined ? requestedPreset : this.#agentPreset;
     if (agentPreset != null) payload.agentPreset = agentPreset;
     const created = await this.rpc('session.create', payload, 30_000, rpcOptions);
+    if (typeof created?.sessionId !== 'string' || !created.sessionId) {
+      throw new HarnessTransportError('harness-response-invalid', 'session.create');
+    }
     return created.sessionId;
   }
 
@@ -1329,9 +1406,15 @@ export class HarnessClient {
   }
 
   // A diagnostic recheck must not hide the original failure or cancellation.
-  async #confirmedArchiveError(sessionId, options, cause) {
+  async #confirmedSessionError(sessionId, options, cause) {
     try {
       if (await this.#isSessionArchived(sessionId, options)) return sessionArchivedError(sessionId, cause);
+      if (isSessionLogCorrupt(cause)) {
+        return Object.assign(new Error('Stored Session log is unreadable', { cause }), {
+          code: 'session-unreadable', method: cause.method,
+          details: { reason: 'session-log-corrupt' },
+        });
+      }
     } catch (error) {
       if (options?.signal?.aborted) throw options.signal.reason ?? error;
     }
@@ -1344,8 +1427,8 @@ export class HarnessClient {
     } catch (error) {
       if (options?.signal?.aborted) throw options.signal.reason ?? error;
       if (error instanceof HarnessRpcError
-        && ['internal', 'gateway/internal', 'session-not-found', 'session/not-found'].includes(error.code)) {
-        throw await this.#confirmedArchiveError(payload.sessionId, { signal: options?.signal }, error) ?? error;
+        && (['internal', 'gateway/internal'].includes(error.code) || isSessionNotFound(error.code))) {
+        throw await this.#confirmedSessionError(payload.sessionId, { signal: options?.signal }, error) ?? error;
       }
       throw error;
     }
@@ -1360,7 +1443,7 @@ export class HarnessClient {
       return true;
     } catch (error) {
       if (error.code === 'session-archived') return true;
-      if (error instanceof HarnessRpcError && error.code === 'session-not-found') return false;
+      if (error instanceof HarnessRpcError && isSessionNotFound(error.code)) return false;
       throw error;
     }
   }
@@ -1409,6 +1492,7 @@ export class HarnessClient {
     onSessionEvent,
     onOpen,
     ownership,
+    onDiagnostic,
   } = {}) {
     if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
     if (!signal || typeof signal.addEventListener !== 'function') {
@@ -1426,8 +1510,17 @@ export class HarnessClient {
     if (onOpen !== undefined && typeof onOpen !== 'function') {
       throw new TypeError('onOpen must be a function');
     }
-
+    let attempts = 0;
+    let lastFailureReason;
+    const report = () => {
+      try {
+        Promise.resolve(onDiagnostic?.({ attempts, ...(lastFailureReason ? { lastFailureReason } : {}) }))
+          .catch(() => undefined);
+      } catch { /* Diagnostics cannot change stream/reconnect behavior. */ }
+    };
     while (!signal.aborted) {
+      attempts += 1;
+      report();
       try {
         await this.#watchInteractionStream(sessionId, {
           signal,
@@ -1439,6 +1532,8 @@ export class HarnessClient {
         });
       } catch (error) {
         if (signal.aborted) return;
+        lastFailureReason = extractConnectionEvidence(error).details.reason;
+        report();
         console.warn('[dsh-im] Harness interaction stream disconnected:', this.#logPrefix, error.message);
       }
       if (signal.aborted) return;
@@ -1522,7 +1617,7 @@ export class HarnessClient {
       );
       this.#consumeInteractionOwnerships(sessionId, history.events ?? []);
     } catch (error) {
-      if (!(error instanceof HarnessRpcError) || error.code !== 'session-not-found') throw error;
+      if (!(error instanceof HarnessRpcError) || !isSessionNotFound(error.code)) throw error;
       for (const ownership of candidates) {
         ownership.active = false;
         ownership.completed = true;
@@ -1593,7 +1688,7 @@ export class HarnessClient {
       if (this.#activeControlOwnership(sessionId, control) === ownership) {
         ownership.stopRequested = false;
       }
-      if (error instanceof HarnessRpcError && error.code === 'session-not-found') return false;
+      if (error instanceof HarnessRpcError && isSessionNotFound(error.code)) return false;
       throw error;
     }
   }
@@ -1711,6 +1806,16 @@ export class HarnessClient {
 
   async ask(sessionId, prompt, options = {}) {
     if (typeof options === 'number') options = { timeoutMs: options };
+    const diagnostic = { stage: 'prompt.prepare', submissionState: 'not-submitted', sessionId };
+    try {
+      return await this.#ask(sessionId, prompt, options, diagnostic);
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw messageDiagnosticError(error, diagnostic);
+    }
+  }
+
+  async #ask(sessionId, prompt, options, diagnostic) {
     const timeoutMs = options.timeoutMs ?? 600_000;
     const signal = options.signal;
     const onUpdate = typeof options.onUpdate === 'function' ? options.onUpdate : null;
@@ -1740,6 +1845,7 @@ export class HarnessClient {
     );
     const baselineSeq = Math.max(-1, ...(before.events ?? []).map(({ event }) => event.seq ?? -1));
     const promptRpcId = `${this.#rpcIdPrefix}-${randomUUID()}`;
+    diagnostic.promptRpcId = promptRpcId;
     const releasePromptInputOrigin = registerImInputOrigin(this.#interactionRegistry, promptRpcId);
     const tracker = new HarnessReplyTracker({
       promptRpcId, afterSeq: baselineSeq, reasoning, finalAnswerOnly: options.finalAnswerOnly,
@@ -1766,10 +1872,15 @@ export class HarnessClient {
         progressTail = progressTail
           .then(() => onUpdate(update))
           .catch((error) => {
+            // The WeCom SDK rejects with the raw ack frame (no .message), so
+            // surface errcode/errmsg explicitly instead of printing undefined.
+            const detail = error instanceof Error
+              ? error.message
+              : `${error?.errmsg ?? error?.body?.errmsg ?? '(no message)'} (errcode=${error?.errcode ?? error?.body?.errcode ?? 'unknown'})`;
             console.warn(
               '[dsh-im] ignored a progress update failure:',
               this.#logPrefix,
-              error.message,
+              detail,
             );
           });
       }
@@ -1837,6 +1948,7 @@ export class HarnessClient {
       this.#registerControlOwnership(ownership);
     }
     // Advertise delivery only when this request can actually claim its files.
+    const closeGroupHistoryAccess = groupHistoryAccess.open(sessionId, promptRpcId, options.groupHistory);
     const closeArtifactConsumer = typeof onArtifact === 'function'
       ? outboundArtifactRegistry.openConsumer(sessionId, promptRpcId)
       : null;
@@ -1869,6 +1981,9 @@ export class HarnessClient {
         });
       }
       if (interactionSignal) {
+        diagnostic.stage = 'interaction.open';
+        const startedAt = performance.now();
+        let streamDiagnostic = { attempts: 0 };
         let markOpen;
         const opened = new Promise((resolve) => { markOpen = resolve; });
         interactionTask = this.watchInteractions(sessionId, {
@@ -1880,16 +1995,25 @@ export class HarnessClient {
             : undefined,
           onOpen: markOpen,
           ownership,
+          onDiagnostic: (value) => { streamDiagnostic = value; },
         });
         void interactionTask.catch(() => undefined);
         await Promise.race([
           opened,
           sleep(30_000, interactionSignal).then(() => {
-            throw new Error('Harness interaction stream did not open within 30 seconds');
+            throw Object.assign(new HarnessInteractionError(
+              'harness-interaction-timeout',
+              'Harness interaction stream did not open within 30 seconds',
+            ), {
+              transport: this.#apiProxy ? 'host-api' : 'websocket',
+              durationMs: Math.round(performance.now() - startedAt),
+              timeoutMs: 30_000,
+              ...streamDiagnostic,
+            });
           }),
         ]);
       }
-
+      diagnostic.stage = 'prompt.prepare';
       const content = typeof prompt === 'string'
         ? [{ type: 'text', text: prompt }]
         : prompt;
@@ -1903,12 +2027,16 @@ export class HarnessClient {
       // message that merely looks like a guidance block is not configuration.
       imSourceGuidance.publish(sessionId, options.sourceGuidance);
       const timeZoneFields = clientTimeZoneFields();
-      const sendPrompt = (promptContent) => this.#sessionRpc('session.prompt', {
-        sessionId,
-        mode: 'queue',
-        content: promptContent,
-        ...timeZoneFields,
-      }, 30_000, { rpcId: promptRpcId, signal });
+      const sendPrompt = (promptContent) => {
+        diagnostic.stage = 'prompt.submit';
+        diagnostic.submissionState = 'unknown';
+        return this.#sessionRpc('session.prompt', {
+          sessionId,
+          mode: 'queue',
+          content: promptContent,
+          ...timeZoneFields,
+        }, 30_000, { rpcId: promptRpcId, signal });
+      };
       try {
         await sendPrompt(content);
       } catch (error) {
@@ -1948,6 +2076,8 @@ export class HarnessClient {
         await sendPrompt(fallbackPrompt);
       }
       promptAccepted = true;
+      diagnostic.submissionState = 'accepted';
+      diagnostic.stage = 'reply.wait';
 
       try {
         // Treat timeoutMs as a stall window rather than a hard runtime limit.
@@ -1974,7 +2104,7 @@ export class HarnessClient {
             if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
               const failure = harnessTurnError(tracker.reason);
               if (failure.code === 'turn-blocked') {
-                throw await this.#confirmedArchiveError(sessionId, { signal }, failure) ?? failure;
+                throw await this.#confirmedSessionError(sessionId, { signal }, failure) ?? failure;
               }
               throw failure;
             }
@@ -2008,7 +2138,7 @@ export class HarnessClient {
               .map((event) => event.seq));
             if (blockedSeq > checkedBlockedSeq) {
               checkedBlockedSeq = blockedSeq;
-              const archived = await this.#confirmedArchiveError(sessionId, { signal });
+              const archived = await this.#confirmedSessionError(sessionId, { signal });
               if (archived) throw archived;
             }
           }
@@ -2016,7 +2146,7 @@ export class HarnessClient {
           if (Date.now() - lastProgressAt < timeoutMs) continue;
 
           if (!ownership?.stopRequested) {
-            const archived = await this.#confirmedArchiveError(sessionId, { signal });
+            const archived = await this.#confirmedSessionError(sessionId, { signal });
             if (archived) throw archived;
           }
 
@@ -2032,6 +2162,8 @@ export class HarnessClient {
             continue;
           }
           const timeoutError = new HarnessTurnError('harness-reply-timeout');
+          timeoutError.durationMs = Date.now() - lastProgressAt;
+          timeoutError.timeoutMs = timeoutMs;
           // Data-only context for deferred delivery; timeout semantics unchanged.
           timeoutError.details = { sessionId, promptRpcId, baselineSeq, turn: tracker.turn, lastSeq: tracker.lastSeq };
           throw timeoutError;
@@ -2067,6 +2199,7 @@ export class HarnessClient {
         }
       }
       closeArtifactConsumer?.();
+      closeGroupHistoryAccess();
       if (ownership) {
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);

@@ -1,3 +1,4 @@
+import { captureGroupHistory, groupHistoryEntry } from '../shared/group-history.mjs';
 import { extractConnectionEvidence, createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { createEditableMessageStream, splitMessageText } from '../shared/editable-message-stream.mjs';
 import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
@@ -544,6 +545,7 @@ export class DiscordRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -577,6 +579,7 @@ export class DiscordRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -594,6 +597,7 @@ export class DiscordRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'discord', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -864,6 +868,9 @@ export class DiscordRuntime {
     const messageId = String(message?.id ?? '');
     if (!messageId || this.#state.hasSeen(messageId)) return;
     const preflight = normalizeDiscordMessage(message, this.#config.platformId);
+    if (preflight) await captureGroupHistory(this.#groupHistory, preflight, groupHistoryEntry('discord', message, preflight, {
+      groupName: this.#channels.get(String(message.channel_id))?.name,
+    }), { logger: this.#logger });
     let accessDecision;
     if (preflight?.kind === 'group' && preflight.addressed === true
       && preflight.senderIsBot !== true) {
@@ -903,6 +910,7 @@ export class DiscordRuntime {
     try {
       const normalized = await route.pendingRoute;
       if (normalized) {
+        normalized.groupHistory = preflight?.groupHistory;
         await bridge.accept(normalized, {
           contextSnapshot: route.contextSnapshot,
           busyMessageMode: route.busyMessageMode,

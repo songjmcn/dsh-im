@@ -23,7 +23,7 @@ function sessionIdOf(session) {
 
 function userInputOrigin(scope, event) {
   const source = event?.data?.source;
-  if (source?.kind === 'schedule') return 'dsh';
+  if (source?.kind === 'schedule' || source?.kind === 'user-question-reply') return 'dsh';
   if (source?.kind !== 'user' || typeof source.rpcId !== 'string' || !source.rpcId) {
     return 'other';
   }
@@ -116,9 +116,9 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
       if (event.surfaceOp !== 'append') return;
       if (state.origin === 'unknown') state.origin = origin;
       if (state.origin !== 'dsh' || origin !== 'dsh') return;
-      const scheduled = event.data?.source?.kind === 'schedule';
+      const internalInput = ['schedule', 'user-question-reply'].includes(event.data?.source?.kind);
       const text = textFromHarnessContent(event.data?.content);
-      if (!text && !scheduled) return;
+      if (!text && !internalInput) return;
 
       let targets;
       try {
@@ -127,9 +127,9 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
         logFailure('lookup', null, error);
         targets = [];
       }
-      // Scheduled framing is internal: select its recipients without echoing it.
+      // Reminder/question-answer framing is internal: select recipients without echoing it.
       // Direct DSH input still requires a successful echo before the final answer.
-      const recipients = scheduled
+      const recipients = internalInput
         ? new Map(targets.filter(validRecipient).map((target) => [recipientKey(target), target]))
         : await deliver(sessionId, targets, `${DSH_USER_PREFIX}${text}`, 'user delivery');
       if (state.recipients === null) {

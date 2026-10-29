@@ -174,7 +174,8 @@ test('installed Session sync classifies an unregistered Host user rpcId as direc
   assert.equal(disposed, 1);
 });
 
-test('installed Session sync sends one scheduled answer without echoing its internal input', async () => {
+for (const kind of ['schedule', 'user-question-reply']) {
+test(`installed Session sync sends one ${kind} answer without echoing its internal input`, async () => {
   let listener;
   const sends = [];
   const installed = installSessionSyncCoordinator({
@@ -188,7 +189,7 @@ test('installed Session sync sends one scheduled answer without echoing its inte
   listener(session, turnStart());
   listener(session, {
     ...userMessage('internal reminder framing'),
-    data: { source: { kind: 'schedule' }, content: [{ type: 'text', text: 'internal reminder framing' }] },
+    data: { source: { kind }, content: [{ type: 'text', text: 'internal reminder framing' }] },
   });
   listener(session, assistantMessage(1, 'second step'));
   listener(session, assistantMessage(0, 'first step'));
@@ -202,6 +203,7 @@ test('installed Session sync sends one scheduled answer without echoing its inte
   ]]);
   installed.close();
 });
+}
 
 test('all eleven sync channels request Markdown for answers while Feishu retains its plain mirror fallback', async () => {
   const channels = ['feishu', 'telegram', 'qq', 'dingtalk', 'slack', 'wecom',

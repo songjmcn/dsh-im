@@ -1,3 +1,4 @@
+import { installGroupHistoryTools } from '../../src/channels/shared/group-history-access.mjs';
 import { apply as applyDingtalk } from './channels/dingtalk/index.mjs';
 import { apply as applyDiscord } from './channels/discord/index.mjs';
 import { apply as applyOffice } from './channels/office/index.mjs';
@@ -18,7 +19,10 @@ import { installHostLanguageRpc } from './host-language-rpc.mjs';
 import { installDeliveryRpc } from './delivery-rpc.mjs';
 import { installDeliveryHttp } from './delivery-http.mjs';
 import { createDeliveryService } from './delivery-service.mjs';
+import { createDsBotClient } from './ds-bot-client.mjs';
+import { installDsBotQuestionSync } from './ds-bot-question-sync.mjs';
 import { installInboundTtlRpc } from './inbound-ttl-rpc.mjs';
+import { installSidebarSettingsRpc } from './sidebar-settings.mjs';
 import { installInjectedContext } from './injected-context.mjs';
 import { installSessionSyncCoordinator } from './session-sync-coordinator.mjs';
 import { installSessionTitlePrefix } from './session-title-prefix.mjs';
@@ -32,7 +36,7 @@ export const inject = [
 ];
 
 function channelConfig(config, name, deliveryService) {
-  const channel = config[name] ?? {};
+  const channel = { ...(config.dshHome ? { dshHome: config.dshHome } : {}), ...config[name] };
   const withAuthority = config.rpcAuthority === undefined
     ? channel
     : { ...channel, rpcAuthority: config.rpcAuthority };
@@ -44,6 +48,7 @@ export function createImHostPlugin(internals = {}) {
   const startHostLanguageRpc = internals.installHostLanguageRpc ?? installHostLanguageRpc;
   const startUpdate = internals.installUpdateRpc ?? installUpdateRpc;
   const startInboundTtl = internals.installInboundTtlRpc ?? installInboundTtlRpc;
+  const startSidebarSettings = internals.installSidebarSettingsRpc ?? installSidebarSettingsRpc;
   const startInjectedContext = internals.installInjectedContext ?? installInjectedContext;
   const startDelivery = internals.installDeliveryRpc ?? installDeliveryRpc;
   const startDeliveryHttp = internals.installDeliveryHttp ?? installDeliveryHttp;
@@ -88,7 +93,10 @@ export function createImHostPlugin(internals = {}) {
         .map(([channel]) => channel)
         .filter((channel) => channel !== 'office'
           && config[channel]?.harnessBaseUrl !== undefined);
-      const deliveryService = makeDeliveryService({ unavailableSessionSyncChannels });
+      const deliveryService = makeDeliveryService({
+        unavailableSessionSyncChannels: unavailableSessionSyncChannels.map((channel) => channel === 'wecomApp' ? 'wecom-app' : channel),
+        dsBot: createDsBotClient(ctx),
+      });
       if (typeof ctx?.provide === 'function') {
         ctx.provide('dshIm', Object.freeze({
           contractVersion: 1,
@@ -103,6 +111,7 @@ export function createImHostPlugin(internals = {}) {
             deliveryService.send(botId, targetId, text, options)
           ),
           listTargets: async (botId) => (await deliveryService.listTargets(botId)).targets,
+          createTarget: (botId, target) => deliveryService.createTarget(botId, target),
           listBots: () => deliveryService.listBots(),
         }));
       }
@@ -147,9 +156,11 @@ export function createImHostPlugin(internals = {}) {
     if (typeof ctx?.inject === 'function') {
       ctx.inject(['tools', 'systemPrompt'], (artifactCtx) => {
         installOutboundArtifactTool(artifactCtx);
+        installGroupHistoryTools(artifactCtx);
       });
     } else {
       installOutboundArtifactTool(ctx);
+      installGroupHistoryTools(ctx);
     }
     const logger = typeof ctx?.logger === 'function'
       ? ctx.logger(name)
@@ -171,6 +182,11 @@ export function createImHostPlugin(internals = {}) {
         startUpdate(ctx);
       } catch (error) {
         logger.error?.('[dsh-im] failed to activate update management; continuing with channels', error);
+      }
+      try {
+        startSidebarSettings(ctx, { config });
+      } catch (error) {
+        logger.error?.('[dsh-im] failed to activate sidebar settings; continuing with channels', error);
       }
       try {
         startInboundTtl(ctx, { config });
@@ -203,6 +219,7 @@ export function createImHostPlugin(internals = {}) {
           logger,
           inputScope: ctx.root ?? ctx,
         });
+        installDsBotQuestionSync(ctx, deliveryService, { logger });
       } catch (error) {
         logger.error?.('[dsh-im] failed to activate Session sync; continuing with channels', error);
       }

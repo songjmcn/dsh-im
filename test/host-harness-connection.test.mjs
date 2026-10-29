@@ -55,7 +55,7 @@ test('Host and all IM channel plugins require the modern gateway', async () => {
   }
 });
 
-async function assembledHarness(channel, ctx, config = {}) {
+async function assembledHarness(channel, ctx, config = {}, inspect) {
   const { createProductionController } = await import(
     `../plugin-src/host/channels/${channel}/production.mjs`
   );
@@ -66,10 +66,15 @@ async function assembledHarness(channel, ctx, config = {}) {
   }
   class Harness {
     constructor(options) { constructed.harness = options; }
+    async listModels(options) {
+      (constructed.modelReads ??= []).push(options);
+      return { groups: [{ id: 'provider', name: 'Provider', models: [{ id: 'model', name: 'Model' }] }], failures: [] };
+    }
     stopManagedProcess() {}
   }
   class Controller {
     constructor(options) { constructed.controller = options; }
+    status() { return { bots: [{ botId: 'one' }] }; }
     async initialize() {}
     async close() {}
   }
@@ -94,6 +99,8 @@ async function assembledHarness(channel, ctx, config = {}) {
       async reconcile() {},
       async ensure() {},
       decorateStatus(value) { return value; },
+      incarnationFor() { return 'incarnation'; },
+      async setModel() {},
     },
     createConnectionSupervisor: () => ({
       ready: Promise.resolve(),
@@ -106,6 +113,7 @@ async function assembledHarness(channel, ctx, config = {}) {
       constructed.controller.createRuntime({});
       constructed.runtime.createHarness({ workspace: '/test/workspace' });
     }
+    await inspect?.(production, constructed);
     return constructed.harness;
   } finally {
     await production.close();
@@ -134,5 +142,15 @@ for (const channel of [...IM_CHANNELS, 'office']) {
     assert.equal(Object.hasOwn(options, 'apiProxy'), false);
     assert.equal(Object.hasOwn(options, 'interactionScope'), false);
     assert.equal(options.autostart, false);
+  });
+}
+
+for (const channel of IM_CHANNELS) {
+  test(`${channel} production forwards fresh catalog options when saving a model`, async () => {
+    await assembledHarness(channel, modernContext({ credentials: {} }), {}, async (production, constructed) => {
+      const status = await production.controller.updateModel('one', { provider: 'provider', model: 'model' });
+      assert.deepEqual(constructed.modelReads, [{ fresh: true }]);
+      assert.equal(status.modelCatalog.groups[0].models[0].id, 'model');
+    });
   });
 }

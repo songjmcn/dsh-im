@@ -1,8 +1,8 @@
 // Resolution policy for the DSH interface language that dsh-im's bot messages
 // follow.
 //
-// The host message language (./i18n.mjs) is a two-value switch: English, or
-// Chinese as the always-available fallback. The DSH interface language is a
+// The host message language (./i18n.mjs) selects Chinese, English, or Russian,
+// with English as the fallback for other tags. The DSH interface language is a
 // BCP 47-style tag that a language pack may extend beyond the shipped zh/en
 // pair, so a tag is carried verbatim through resolution and persistence and is
 // collapsed to a dictionary language only where it reaches setImHostLanguage().
@@ -40,7 +40,7 @@ export function normalizeInterfaceLanguageTag(value) {
 /**
  * Pick the winning interface-language tag across the layers, in
  * HOST_LANGUAGE_SOURCES order. Returns `{ tag: null, source: 'default' }` when
- * no layer names a usable tag, which keeps Chinese as the shipped default.
+ * no layer names a usable tag, which selects English as the shipped default.
  */
 export function resolveHostLanguageTag(layers = {}) {
   for (const source of HOST_LANGUAGE_SOURCES) {

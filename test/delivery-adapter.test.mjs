@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { DingtalkStateStore } from '../src/channels/dingtalk/state-store.mjs';
 import { DiscordStateStore } from '../src/channels/discord/state-store.mjs';
+import { normalizeEmail } from '../src/channels/email/email-runtime.mjs';
 import { StateStore as FeishuStateStore } from '../src/channels/feishu/state-store.mjs';
 import { QqStateStore } from '../src/channels/qq/state-store.mjs';
 import { SlackStateStore } from '../src/channels/slack/state-store.mjs';
@@ -18,7 +19,10 @@ import {
   createDeliveryAdapter,
   normalizeDeliveryTarget,
 } from '../plugin-src/host/delivery-adapter.mjs';
-import { deliverySuggestionsFromSessions } from '../plugin-src/host/delivery-suggestions.mjs';
+import {
+  deliverySuggestionsFromSessions,
+  privateDeliverySuggestionFromConversationKey,
+} from '../plugin-src/host/delivery-suggestions.mjs';
 
 const TARGETS = {
   weixin: { targetId: 'daily', kind: 'user', route: { toUserId: 'wx-user' } },
@@ -196,6 +200,79 @@ test('all ten delivery adapters validate and forward one stable target', async (
       'send', `bot-${channel}`, target, 'hello', { signal: undefined },
     ]);
   }
+});
+
+test('email Message-IDs and bound sessions never become delivery recipients', async () => {
+  const sessions = {};
+  for (const messageId of [
+    '<m1@mail.example>',
+    '<tencent_0123456789abcdef0123456789abcdef@qq.com>',
+  ]) {
+    const message = normalizeEmail({
+      messageId,
+      from: { value: [{ address: 'user@example.com' }] },
+      text: 'Hello',
+    });
+    assert.equal(message.replyTarget.to, 'user@example.com');
+    assert.equal(message.conversationId, messageId);
+    sessions[`${message.kind}:${message.conversationId}`] = 'session-email';
+  }
+  // Neither unwrapped identifiers nor fixed bindings identify a recipient.
+  sessions['direct:m1@mail.example'] = 'session-unwrapped';
+  sessions['direct:bound:session-fixed'] = 'session-fixed';
+  const adapter = createDeliveryAdapter({
+    channel: 'email',
+    workspaces: { dsBotConversationKeys: () => [] },
+    coreController: {},
+    stateFor: async () => ({ snapshot: () => ({ sessions }) }),
+  });
+
+  assert.deepEqual(await adapter.listSuggestions('bot-email'), []);
+  assert.deepEqual(await adapter.listDsBotConversations('bot-email'), []);
+  for (const key of Object.keys(sessions)) {
+    assert.equal(privateDeliverySuggestionFromConversationKey('email', key), null, key);
+  }
+});
+
+test('email delivery creates and sends explicit recipients without inferring Session sync', async () => {
+  const botId = 'bot-email';
+  const calls = [];
+  let saved;
+  const adapter = createDeliveryAdapter({
+    channel: 'email',
+    workspaces: {
+      createDeliveryTarget: async (id, target) => {
+        assert.equal(id, botId);
+        saved = target;
+        return target;
+      },
+      listDeliveryTargets: () => [saved],
+      deliveryTargetFor: () => saved,
+      setDeliveryTargetSessionSync: () => assert.fail('Email has no recipient-to-session mapping'),
+    },
+    coreController: {
+      async sendProactiveText(...args) { calls.push(args); },
+    },
+    stateFor: async () => ({ snapshot: () => ({
+      sessions: { 'direct:<user@example.com>': 'message-id-session' },
+    }) }),
+  });
+  const target = await adapter.createTarget(botId, {
+    targetId: 'recipient', kind: 'user', route: { address: 'User@Example.COM' },
+  });
+  assert.deepEqual(target, {
+    targetId: 'recipient', kind: 'user', route: { address: 'user@example.com' },
+  });
+  const [listed] = await adapter.listTargets(botId);
+  assert.deepEqual(listed.sessionSync, { enabled: false, state: 'unavailable' });
+  await assert.rejects(adapter.setSessionSync(botId, target.targetId, true), {
+    code: 'session-sync-unavailable',
+  });
+  assert.deepEqual(await adapter.sendText(botId, listed, 'hello'), { sent: true });
+  assert.deepEqual(calls, [[botId, target, 'hello', {}]]);
+  assert.throws(() => adapter.createTarget(botId, {
+    targetId: 'invalid', kind: 'user', route: { address: '<m1@mail.example>' },
+  }), { code: 'invalid-target' });
 });
 
 test('all adapters enable, resolve, and revalidate one private Session target', async () => {
